@@ -34,7 +34,7 @@ from vllm.model_executor.layers.fla.ops import (
     chunk_gated_delta_rule as fla_chunk_gated_delta_rule,
 )
 from vllm.model_executor.layers.fla.ops import (
-    fused_recurrent_gated_delta_rule,
+    fused_rearrange_recurrent_gated_delta_rule,
 )
 from vllm.model_executor.layers.fla.ops.chunk import l2norm_fwd
 from vllm.model_executor.layers.fused_moe import SharedFusedMoE
@@ -725,10 +725,10 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         else:
             mixed_qkv_non_spec = None
 
-        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
-        query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
-            mixed_qkv_non_spec
-        )
+        #query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
+        #query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
+        #    mixed_qkv_non_spec
+        #)
 
         g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
 
@@ -753,11 +753,13 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
-            core_attn_out_spec, last_recurrent_state = fused_recurrent_gated_delta_rule(
-                q=query_spec,
-                k=key_spec,
-                v=value_spec,
+            core_attn_out_spec, last_recurrent_state = fused_rearrange_recurrent_gated_delta_rule(
+                qkv=mixed_qkv_spec,
                 g=g_spec,
+                key_dim=self.key_dim // self.tp_size,
+                value_dim=self.value_dim // self.tp_size,
+                head_k_dim=self.head_k_dim,
+                head_v_dim=self.head_v_dim,
                 beta=beta_spec,
                 initial_state=ssm_state,
                 inplace_final_state=True,
@@ -771,6 +773,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
         # 2.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
+            ## TODO: fuse rearrage with chunk kernel as well
             initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
             initial_state[~has_initial_state, ...] = 0
             (
@@ -793,11 +796,13 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             )
         elif attn_metadata.num_decodes > 0:
             core_attn_out_non_spec, last_recurrent_state = (
-                fused_recurrent_gated_delta_rule(
-                    q=query_non_spec,
-                    k=key_non_spec,
-                    v=value_non_spec,
+                fused_rearrange_recurrent_gated_delta_rule(
+                    qkv=mixed_qkv_non_spec,
                     g=g_non_spec,
+                    key_dim=self.key_dim // self.tp_size,
+                    value_dim=self.value_dim // self.tp_size,
+                    head_k_dim=self.head_k_dim,
+                    head_v_dim=self.head_v_dim,
                     beta=beta_non_spec,
                     initial_state=ssm_state,
                     inplace_final_state=True,
