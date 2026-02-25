@@ -76,9 +76,6 @@ def fused_rearrange_recurrent_gated_delta_rule_fwd_kernel(
         # no tokens to process for this sequence
         return
 
-    q = qkv
-    k = qkv + 
-
     o_k = i_k * BK + tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
 
