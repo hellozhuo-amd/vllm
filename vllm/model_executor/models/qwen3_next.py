@@ -590,7 +590,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         query, key, value = map(
             lambda x: rearrange(x, "l p d -> l (p d)"), (query, key, value)
         )
-        mixed_qkv = torch.cat((query, key, value), dim=-1)
+        #mixed_qkv = torch.cat((query, key, value), dim=-1)
 
         # ============================================================
         # Part 2: Core Attention (Custom Op)
@@ -604,7 +604,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         )
 
         torch.ops.vllm.gdn_attention_core(
-            mixed_qkv,
+            query,
+            key,
+            value,
             b,
             a,
             core_attn_out,
@@ -625,7 +627,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
     def _forward_core(
         self,
-        mixed_qkv: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
         b: torch.Tensor,
         a: torch.Tensor,
         core_attn_out: torch.Tensor,
@@ -657,7 +661,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_accepted_tokens = attn_metadata.num_accepted_tokens
 
-        mixed_qkv = mixed_qkv[:num_actual_tokens]
         b = b[:num_actual_tokens]
         a = a[:num_actual_tokens]
 
@@ -667,15 +670,23 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         )
 
         if spec_sequence_masks is not None:
+            mixed_qkv = torch.cat((query, key, value), dim=-1)
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
+                mixed_qkv = mixed_qkv[:num_actual_tokens]
                 mixed_qkv_spec = mixed_qkv
                 mixed_qkv_non_spec = None
             else:
                 mixed_qkv_spec = mixed_qkv.index_select(0, spec_token_indx)
                 mixed_qkv_non_spec = mixed_qkv.index_select(0, non_spec_token_indx)
-        else:
+        elif attn_metadata.num_prefills > 0:
+            mixed_qkv = torch.cat((query, key, value), dim=-1)
             mixed_qkv_spec = None
             mixed_qkv_non_spec = mixed_qkv
+        else:
+            mixed_qkv_spec = None
+            mixed_qkv_non_spec = None
+            #mixed_qkv_non_spec = mixed_qkv
+        ## Note: there is also a case where spec_sequence_masks is not None and num_prefills = 0 and num_decodes > 0. In this case at least one of mixed_qkv_spec and mixed_qkv_non_spec is not None
 
         # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
@@ -710,7 +721,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 query_start_loc=non_spec_query_start_loc,
                 metadata=attn_metadata,
             ).transpose(0, 1)
-        elif attn_metadata.num_decodes > 0:
+        elif mixed_qkv_non_spec is not None and attn_metadata.num_decodes > 0:
             mixed_qkv_non_spec = causal_conv1d_update(
                 mixed_qkv_non_spec,
                 conv_state,
@@ -724,11 +735,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             )
         else:
             mixed_qkv_non_spec = None
-
-        #query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
-        #query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
-        #    mixed_qkv_non_spec
-        #)
 
         g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
 
@@ -799,24 +805,65 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 ssm_state.dtype
             )
         elif attn_metadata.num_decodes > 0:
-            core_attn_out_non_spec, last_recurrent_state = (
-                fused_rearrange_recurrent_gated_delta_rule(
-                    qkv=mixed_qkv_non_spec,
-                    g=g_non_spec,
-                    key_dim=self.key_dim // self.tp_size,
-                    value_dim=self.value_dim // self.tp_size,
-                    head_k_dim=self.head_k_dim,
-                    head_v_dim=self.head_v_dim,
-                    beta=beta_non_spec,
-                    initial_state=ssm_state,
-                    inplace_final_state=True,
-                    cu_seqlens=non_spec_query_start_loc[
-                        : attn_metadata.num_decodes + 1
-                    ],
-                    ssm_state_indices=non_spec_state_indices_tensor,
-                    use_qk_l2norm_in_kernel=True,
+            if mixed_qkv_non_spec is not None:
+                core_attn_out_non_spec, last_recurrent_state = (
+                    fused_rearrange_recurrent_gated_delta_rule(
+                        qkv=mixed_qkv_non_spec,
+                        q=q,
+                        k=k,
+                        v=k,
+                        num_actual_tokens=num_actual_tokens,
+                        g=g_non_spec,
+                        key_dim=self.key_dim // self.tp_size,
+                        value_dim=self.value_dim // self.tp_size,
+                        head_k_dim=self.head_k_dim,
+                        head_v_dim=self.head_v_dim,
+                        beta=beta_non_spec,
+                        initial_state=ssm_state,
+                        inplace_final_state=True,
+                        cu_seqlens=non_spec_query_start_loc[
+                            : attn_metadata.num_decodes + 1
+                        ],
+                        ssm_state_indices=non_spec_state_indices_tensor,
+                        use_qk_l2norm_in_kernel=True,
+                    )
                 )
-            )
+            ## now, we fuse causal_conv1d_update + rearrange + gated delta rule
+            else:
+                mixed_qkv_non_spec = torch.cat((query, key, value), dim=-1)
+                mixed_qkv_non_spec = causal_conv1d_update(
+                    mixed_qkv_non_spec,
+                    conv_state,
+                    conv_weights,
+                    self.conv1d.bias,
+                    self.activation,
+                    conv_state_indices=non_spec_state_indices_tensor[
+                        : attn_metadata.num_actual_tokens
+                    ],
+                    validate_data=True,
+                )
+                core_attn_out_non_spec, last_recurrent_state = (
+                    fused_rearrange_recurrent_gated_delta_rule(
+                        qkv=mixed_qkv_non_spec,
+                        q=q,
+                        k=k,
+                        v=k,
+                        num_actual_tokens=num_actual_tokens,
+                        g=g_non_spec,
+                        key_dim=self.key_dim // self.tp_size,
+                        value_dim=self.value_dim // self.tp_size,
+                        head_k_dim=self.head_k_dim,
+                        head_v_dim=self.head_v_dim,
+                        beta=beta_non_spec,
+                        initial_state=ssm_state,
+                        inplace_final_state=True,
+                        cu_seqlens=non_spec_query_start_loc[
+                            : attn_metadata.num_decodes + 1
+                        ],
+                        ssm_state_indices=non_spec_state_indices_tensor,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                )
         else:
             core_attn_out_non_spec, last_recurrent_state = None, None
 
@@ -1443,7 +1490,9 @@ class Qwen3NextForCausalLM(
 
 
 def gdn_attention_core(
-    mixed_qkv: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
     b: torch.Tensor,
     a: torch.Tensor,
     core_attn_out: torch.Tensor,
@@ -1457,7 +1506,9 @@ def gdn_attention_core(
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
     self._forward_core(
-        mixed_qkv=mixed_qkv,
+        q=query,
+        k=key,
+        v=value,
         b=b,
         a=a,
         core_attn_out=core_attn_out,
@@ -1465,7 +1516,9 @@ def gdn_attention_core(
 
 
 def gdn_attention_core_fake(
-    mixed_qkv: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
     b: torch.Tensor,
     a: torch.Tensor,
     core_attn_out: torch.Tensor,
