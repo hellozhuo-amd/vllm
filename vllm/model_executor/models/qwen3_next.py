@@ -35,6 +35,7 @@ from vllm.model_executor.layers.fla.ops import (
 )
 from vllm.model_executor.layers.fla.ops import (
     fused_rearrange_recurrent_gated_delta_rule,
+    fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule,
 )
 from vllm.model_executor.layers.fla.ops.chunk import l2norm_fwd
 from vllm.model_executor.layers.fused_moe import SharedFusedMoE
@@ -858,21 +859,13 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                         use_qk_l2norm_in_kernel=True,
                     )
                 )
+
                 ## using fused kernel
                 #core_attn_out_non_spec, last_recurrent_state = (
-                #    fused_casual_conv1d_update_rearrange_recurrent_gated_delta_rule(
+                #    fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule(
                 #        q=q,
                 #        k=k,
                 #        v=v,
-                #        num_actual_tokens=num_actual_tokens,
-                #        conv_state=conv_state,
-                #        conv_weights=conv_weights,
-                #        conv_bias=self.conv1d.bias,
-                #        conv_activateion=self.activation,
-                #        conv_state_indices=non_spec_state_indices_tensor[
-                #            : attn_metadata.num_actual_tokens
-                #        ],
-                #        conv_validate_data=True,
                 #        num_actual_tokens=num_actual_tokens,
                 #        g=g_non_spec,
                 #        key_dim=self.key_dim // self.tp_size,
@@ -887,6 +880,14 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 #        ],
                 #        ssm_state_indices=non_spec_state_indices_tensor,
                 #        use_qk_l2norm_in_kernel=True,
+                #        conv_state=conv_state,
+                #        weights=conv_weights,
+                #        bias=self.conv1d.bias,
+                #        activateion=self.activation,
+                #        conv_state_indices=non_spec_state_indices_tensor[
+                #            : attn_metadata.num_actual_tokens
+                #        ],
+                #        conv_validate_data=True,
                 #    )
                 #)
         else:
