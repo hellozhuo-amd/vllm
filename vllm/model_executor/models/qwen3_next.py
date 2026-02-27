@@ -828,6 +828,18 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 )
             ## now, we fuse causal_conv1d_update + rearrange + gated delta rule
             else:
+                """
+                we focus on the operations here as this part might be the heaviest part during inference
+                following code is sequential use of old kernels
+                basically, we need to fuse 
+
+                    causal_conv1d_update,
+                    rearrange_mixed_qkv,
+                    fused_recurrent_gated_delta_rule
+
+                expected function:
+                fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule
+                """
                 mixed_qkv = torch.cat((q, k, v), dim=-1)
                 mixed_qkv_non_spec = mixed_qkv[:num_actual_tokens]
                 mixed_qkv_non_spec = causal_conv1d_update(
@@ -867,6 +879,14 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 #        k=k,
                 #        v=v,
                 #        num_actual_tokens=num_actual_tokens,
+                #        conv_state=conv_state,
+                #        weights=conv_weights,
+                #        bias=self.conv1d.bias,
+                #        activateion=self.activation,
+                #        conv_state_indices=non_spec_state_indices_tensor[
+                #            : attn_metadata.num_actual_tokens
+                #        ],
+                #        conv_validate_data=True,
                 #        g=g_non_spec,
                 #        key_dim=self.key_dim // self.tp_size,
                 #        value_dim=self.value_dim // self.tp_size,
@@ -880,14 +900,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 #        ],
                 #        ssm_state_indices=non_spec_state_indices_tensor,
                 #        use_qk_l2norm_in_kernel=True,
-                #        conv_state=conv_state,
-                #        weights=conv_weights,
-                #        bias=self.conv1d.bias,
-                #        activateion=self.activation,
-                #        conv_state_indices=non_spec_state_indices_tensor[
-                #            : attn_metadata.num_actual_tokens
-                #        ],
-                #        conv_validate_data=True,
                 #    )
                 #)
         else:
