@@ -10,10 +10,9 @@
 
 import torch
 
-from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
-from .fused_rearrange_recurrent import fused_rearrange_recurrent_gated_delta_rule
 from .op import exp
 
 @triton.jit()
@@ -23,17 +22,18 @@ def _causal_conv1d_update_inner_kernel(
     w_ptr,  # (dim, width)
     bias_ptr, # (dim,)
     conv_state_ptr, # (num_cache_lines, dim, state_len(>=width -1))
-    conv_state_indices_ptr, # (1,)
+    conv_state_indices_ptr, # (seqlen,)
     num_accepted_tokens_ptr, # None, not used
     query_start_loc_ptr,  # (batch + 1), not used
     block_idx_last_scheduled_token,  # (batch,), not used
     initial_state_idx,  # (batch,), not used
     idx_seq,
     idx_feats, # (x_dim,)
+    mask_feats, # (x_dim,)
     # o_ptr,  # (x_dim,), to be returned
     # Matrix dimensions
     # batch: int, = 1
-    dim: tl.constexpr,
+    # dim: tl.constexpr,
     # seqlen: tl.constexpr, = 1
     state_len: tl.constexpr,
     num_cache_lines: tl.constexpr,  # added to support vLLM larger cache lines
@@ -84,7 +84,7 @@ def _causal_conv1d_update_inner_kernel(
     if USE_PAD_SLOT:  # noqa
         if conv_states_input_coord == pad_slot_id:
             # not processing as this is not the actual sequence
-            return loaded_x
+            return loaded_x.to(tl.float32)
 
     # IS_VARLEN is False
     #query_start_index = idx_seq * seqlen
@@ -99,17 +99,19 @@ def _causal_conv1d_update_inner_kernel(
     conv_state_token_offset = 0
 
     # STEP 1: READ init_state data
-    idx_cols = tl.arange(0, KERNEL_WIDTH-1)
+    # note: NP2_STATELEN = triton.next_power_of_2(KERNEL_WIDTH - 1)
+    idx_cols = tl.arange(0, NP2_STATELEN)
     conv_state_ptrs_cols = (
         conv_state_ptr
         + (conv_states_input_coord * stride_conv_state_seq)
         + conv_state_token_offset * stride_conv_state_tok
-        + (idx_feats * stride_conv_state_dim)[None, :]
-        + (idx_cols * stride_conv_state_tok)[:, None]
-    )  # [KERNEL_WIDTH-1, x_dim]
+        + (idx_feats * stride_conv_state_dim)[:, None]
+        + (idx_cols * stride_conv_state_tok)[None, :]
+    )  # [x_dim, NP2_STATELEN]
     mask_cols = (
         (conv_states_input_coord < num_cache_lines)
-        & (idx_feats < dim)[None, :]
+        & mask_feats[:, None]
+        & (idx_cols < KERNEL_WIDTH - 1)[None, :]
     )
     cols = tl.load(conv_state_ptrs_cols, mask_cols, other=0.0)
 
@@ -131,7 +133,7 @@ def _causal_conv1d_update_inner_kernel(
     mask = (
         (conv_states_input_coord < num_cache_lines)
         & ((idx_tokens + seqlen) < state_len)[:, None]
-        & (idx_feats < dim)[None, :]
+        & mask_feats[None, :]
     )
     conv_state = tl.load(conv_state_ptrs_source, mask, other=0.0)
 
@@ -150,7 +152,7 @@ def _causal_conv1d_update_inner_kernel(
     #loaded_x = tl.load(x_ptrs, mask_x, 0.0)
     tl.debug_barrier()
 
-    new_conv_state = tl.where(mask, conv_state, loaded_x)
+    new_conv_state = tl.where(mask, conv_state, loaded_x[None, :])
 
     # Get the state from the initial_state_idx
     # cache_idx
@@ -161,435 +163,330 @@ def _causal_conv1d_update_inner_kernel(
         conv_state_ptr
         + (conv_states_offset * stride_conv_state_seq)  # Offset from seq
         + (idx_feats * stride_conv_state_dim)
-    )[None, :] + (  # [BLOCK_N,]
+    )[None, :] + (  # [,x_dim]
         idx_tokens * stride_conv_state_tok
     )[:, None]
-    mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
+    mask = (idx_tokens < state_len)[:, None] & mask_feats[None, :]
     tl.store(conv_state_ptrs_target, new_conv_state, mask)
 
-    # STEP 3: init accumulator
-    if HAS_BIAS:
-        bias = bias_ptr + idx_feats
-        mask_bias = idx_feats < dim
-        acc_preload = tl.load(bias, mask=mask_bias, other=0.0).to(
-            tl.float32
-        )  # [BLOCK_N]
-    else:
-        acc_preload = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    # STEP 3: init accumulator, not necessary
 
     # STEP 4:
     # PRE-LOAD WEIGHTS
     # first kernel column, configured for weights to handle BLOCK_N features in range
-    w_base = w_ptr + (idx_feats * stride_w_dim)  # [BLOCK_N,]
-    mask_w = idx_feats < dim
-    if KERNEL_WIDTH >= 2:
-        w_ptrs = w_base + (0 * stride_w_width)  # [BLOCK_N] tensor
-        w_col0 = tl.load(w_ptrs, mask_w, other=0.0)
-        w_ptrs = w_base + (1 * stride_w_width)  # [BLOCK_N] tensor
-        w_col1 = tl.load(w_ptrs, mask_w, other=0.0)
-    if KERNEL_WIDTH >= 3:
-        w_ptrs = w_base + (2 * stride_w_width)  # [BLOCK_N] tensor
-        w_col2 = tl.load(w_ptrs, mask_w, other=0.0)
-    if KERNEL_WIDTH >= 4:
-        w_ptrs = w_base + (3 * stride_w_width)  # [BLOCK_N] tensor
-        w_col3 = tl.load(w_ptrs, mask_w, other=0.0)
-    if KERNEL_WIDTH >= 5:
-        w_ptrs = w_base + (4 * stride_w_width)  # [BLOCK_N] tensor
-        w_col4 = tl.load(w_ptrs, mask_w, other=0.0)
-    if KERNEL_WIDTH >= 6:
-        w_ptrs = w_base + (5 * stride_w_width)  # [BLOCK_N] tensor
-        w_col5 = tl.load(w_ptrs, mask_w, other=0.0)
 
-    x_base_1d = x_base  # starting of chunk [BLOCK_N]
-    mask_x_1d = idx_feats < dim
+    w_cols_ptrs = w_ptr + (idx_feats * stride_w_dim)[:, None] + (idx_cols * stride_w_width)[None, :]
+    mask_w_cols = mask_feats[:, None] & (idx_cols < KERNEL_WIDTH - 1)[None, :]
+    w_cols = tl.load(w_cols_ptrs, mask_w_cols, other=0.0)  # [x_dim, NP2_STATELEN]
 
-    # STEP 5: compute each token
-    for idx_token in tl.range(seqlen):
-        acc = acc_preload
+    w_last_ptrs = w_ptr + (idx_feats * stride_w_dim) + (KERNEL_WIDTH - 1) * stride_w_width
+    w_last = tl.load(w_last_ptrs, mask_feats, other=0.0) # [x_dim]
 
-        matrix_w = w_col0
-        matrix_x = col0
-        for j in tl.static_range(KERNEL_WIDTH):
-            if KERNEL_WIDTH == 2:
-                if j == 1:  # KERNEL_WIDTH-1:
-                    matrix_w = w_col1
-                    x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
-            elif KERNEL_WIDTH == 3:
-                if j == 1:
-                    matrix_w = w_col1
-                    matrix_x = col1
-                elif j == 2:
-                    matrix_w = w_col2
-                    x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
-            elif KERNEL_WIDTH == 4:
-                if j == 1:
-                    matrix_w = w_col1
-                    matrix_x = col1
-                elif j == 2:
-                    matrix_w = w_col2
-                    matrix_x = col2
-                elif j == 3:
-                    matrix_w = w_col3
-                    x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
-            elif KERNEL_WIDTH == 5:
-                if j == 1:
-                    matrix_w = w_col1
-                    matrix_x = col1
-                elif j == 2:
-                    matrix_w = w_col2
-                    matrix_x = col2
-                elif j == 3:
-                    matrix_w = w_col3
-                    matrix_x = col3
-                elif j == 4:
-                    matrix_w = w_col4
-                    x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
-            elif KERNEL_WIDTH == 6:
-                if j == 1:
-                    matrix_w = w_col1
-                    matrix_x = col1
-                elif j == 2:
-                    matrix_w = w_col2
-                    matrix_x = col2
-                elif j == 3:
-                    matrix_w = w_col3
-                    matrix_x = col3
-                elif j == 4:
-                    matrix_w = w_col4
-                    matrix_x = col4
-                elif j == 5:
-                    matrix_w = w_col5
-                    x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+    acc = (tl.sum(w_cols * cols, axis=1) + w_last * loaded_x).to(tl.float32)
 
-            acc += matrix_x * matrix_w  # [BLOCK_N]
-
-        if KERNEL_WIDTH == 2:
-            col0 = matrix_x
-        elif KERNEL_WIDTH == 3:
-            col0 = col1
-            col1 = matrix_x
-        elif KERNEL_WIDTH == 4:
-            col0 = col1
-            col1 = col2
-            col2 = matrix_x
-        elif KERNEL_WIDTH == 5:
-            col0 = col1
-            col1 = col2
-            col2 = col3
-            col3 = matrix_x
-        elif KERNEL_WIDTH == 6:
-            col0 = col1
-            col1 = col2
-            col2 = col3
-            col3 = col4
-            col4 = matrix_x
-
-        if SILU_ACTIVATION:
-            acc = acc / (1 + tl.exp(-acc))
-        mask_1d = (idx_token < seqlen) & (
-            idx_feats < dim
-        )  # token-index  # feature-index
-        o_ptrs = (
-            o_ptr + o_offset + idx_token * stride_o_token + (idx_feats * stride_o_dim)
-        )
-
-        tl.store(o_ptrs, acc, mask=mask_1d)
-
-
-
-@triton.jit
-def _apply_conv1d(
-    p_input,
-    p_conv_base,
-    conv_weight,
-    conv_bias,
-    feature_offset,
-    mask,
-    stride_conv_state_dim: tl.constexpr,
-    stride_conv_state_tok: tl.constexpr,
-    stride_conv_weight_dim: tl.constexpr,
-    stride_conv_weight_w: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-    SILU_ACTIVATION: tl.constexpr,
-    BF: tl.constexpr,
-    CONV_WIDTH: tl.constexpr,
-    STATE_LEN: tl.constexpr,
-):
-    """
-    Apply conv1d with sliding window to a feature dimension.
-    Returns the convolved output and updates conv_state in-place.
-    """
-    p_conv_feat = p_conv_base + feature_offset * stride_conv_state_dim
-    
-    # Initialize accumulator with bias
-    acc = tl.zeros((BF,), dtype=tl.float32)
     if HAS_BIAS:
-        p_bias = conv_bias + feature_offset
-        acc += tl.load(p_bias, mask=mask, other=0.0)
-    
-    p_weight = conv_weight + feature_offset * stride_conv_weight_dim
-    
-    # Compute convolution with sliding window
-    for i in tl.static_range(0, CONV_WIDTH):
-        if i < CONV_WIDTH - 1:
-            # Load from conv_state history
-            state_idx = STATE_LEN - (CONV_WIDTH - 1) + i
-            p_state_i = p_conv_feat + state_idx * stride_conv_state_tok
-            state_val = tl.load(p_state_i, mask=mask, other=0.0)
-        else:
-            # Load current input
-            state_val = tl.load(p_input, mask=mask, other=0.0)
-        
-        w_i = tl.load(p_weight + i * stride_conv_weight_w, mask=mask, other=0.0)
-        acc += state_val * w_i
-    
-    # Apply activation
+        bias = bias_ptr + idx_feats
+        acc += tl.load(bias, mask=mask_feats, other=0.0).to(
+            tl.float32
+        )  # [x_dim]
+
     if SILU_ACTIVATION:
-        acc = acc * tl.sigmoid(acc)
-    
-    # Update conv state (shift left and append new value)
-    for i in tl.static_range(0, STATE_LEN - 1):
-        if i < STATE_LEN - 1:
-            p_src = p_conv_feat + (i + 1) * stride_conv_state_tok
-            p_dst = p_conv_feat + i * stride_conv_state_tok
-            val = tl.load(p_src, mask=mask, other=0.0)
-            tl.store(p_dst, val, mask=mask)
-    
-    # Store new value at end of conv state
-    p_new = p_conv_feat + (STATE_LEN - 1) * stride_conv_state_tok
-    new_val = tl.load(p_input, mask=mask, other=0.0)
-    tl.store(p_new, new_val, mask=mask)
-    
+        acc = acc / (1 + tl.exp(-acc))
+
     return acc
 
-
-@triton.jit
-def _fused_conv1d_recurrent_decode_kernel(
-    # Inputs
-    qkv,  # [batch, key_dim*2 + value_dim]
-    conv_state,  # [num_cache_lines, dim, state_len]
-    conv_weight,  # [dim, width]
-    conv_bias,  # [dim] or None
-    g,  # [1, batch, HV]
-    beta,  # [1, batch, HV]
-    conv_state_indices,  # [batch]
-    # Output
-    output,  # [batch, HV, V]
-    ssm_state,  # [num_states, HV, V, K]
-    ssm_state_indices,  # [batch]
-    # Dimensions
-    batch,
-    key_dim,
-    value_dim,
-    HV,
-    K,
-    V,
+@triton.heuristics(
+    {
+        "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+        "IS_CONTINUOUS_BATCHING": lambda args: args["ssm_state_indices"] is not None,
+        "IS_SPEC_DECODING": lambda args: args["num_accepted_tokens"] is not None,
+    }
+)
+@triton.jit(do_not_specialize=["N", "T"])
+def fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule_kernel(
+    qkv,
+    ## for conv1d
+    weight,  # (dim, width)
+    bias,
+    conv_state,
+    conv_state_indices,
+    ## delta rule
+    g,
+    beta,
+    o,
+    h0,
+    ht,
+    cu_seqlens,
+    ssm_state_indices,
+    num_accepted_tokens,
     scale,
-    # Strides
-    stride_qkv_b,
-    stride_qkv_d,
-    stride_conv_state_seq,
-    stride_conv_state_dim,
-    stride_conv_state_tok,
-    stride_conv_weight_dim,
-    stride_conv_weight_w,
-    stride_g_b,
-    stride_g_h,
-    stride_beta_b,
-    stride_beta_h,
-    stride_o_b,
-    stride_o_h,
-    stride_o_v,
-    stride_ssm_n,
-    stride_ssm_h,
-    stride_ssm_v,
-    stride_ssm_k,
-    # Meta params
-    HAS_BIAS: tl.constexpr,
-    SILU_ACTIVATION: tl.constexpr,
-    USE_QK_L2NORM: tl.constexpr,
+    N: tl.int64,  # num of sequences
+    T: tl.int64,  # num of tokens
+    # for conv1d
+    state_len: tl.constexpr,
+    num_cache_lines: tl.constexpr,  # added to support vLLM larger cache lines
+    stride_w_dim: tl.constexpr,
+    stride_w_width: tl.constexpr,
+    stride_conv_state_seq: tl.constexpr,
+    stride_conv_state_dim: tl.constexpr,
+    stride_conv_state_tok: tl.constexpr,
+    stride_state_indices: tl.constexpr,
+    pad_slot_id: tl.constexpr,
+    ## delta rule
+    B: tl.constexpr,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
-    CONV_WIDTH: tl.constexpr,
-    STATE_LEN: tl.constexpr,
+    stride_qkv_l: tl.constexpr,
+    stride_qkv_hd: tl.constexpr,
+    stride_init_state_token: tl.constexpr,
+    stride_final_state_token: tl.constexpr,
+    stride_indices_seq: tl.constexpr,
+    stride_indices_tok: tl.constexpr,
+    USE_INITIAL_STATE: tl.constexpr,  # whether to use initial state
+    INPLACE_FINAL_STATE: tl.constexpr,  # whether to store final state inplace
+    IS_BETA_HEADWISE: tl.constexpr,  # whether beta is headwise vector or scalar,
+    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    IS_CONTINUOUS_BATCHING: tl.constexpr,
+    IS_SPEC_DECODING: tl.constexpr,
+    IS_KDA: tl.constexpr,
+    # for conv1d Meta-parameters
+    HAS_BIAS: tl.constexpr,
+    KERNEL_WIDTH: tl.constexpr,
+    SILU_ACTIVATION: tl.constexpr,
+    NP2_STATELEN: tl.constexpr,
+    USE_PAD_SLOT: tl.constexpr,
 ):
-    """
-    Fused kernel for decode-only (single token) path that combines:
-    1. Causal conv1d update (with width-element sliding window)
-    2. Rearrange qkv 
-    3. Recurrent gated delta rule update
-    
-    Each program processes one (batch_idx, head_v_idx) combination.
-    """
-    pid_b = tl.program_id(0)  # batch index
-    pid_hv = tl.program_id(1)  # value head index
-    
-    if pid_b >= batch or pid_hv >= HV:
+    i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_n, i_hv = i_nh // HV, i_nh % HV
+    i_h = i_hv // (HV // H)
+    if IS_VARLEN:
+        bos, eos = (
+            tl.load(cu_seqlens + i_n).to(tl.int64),
+            tl.load(cu_seqlens + i_n + 1).to(tl.int64),
+        )
+        all = T
+        T = eos - bos
+    else:
+        bos, eos = i_n * T, i_n * T + T
+        all = B * T
+
+    if T == 0:
+        # no tokens to process for this sequence
         return
-    
-    # Get head-k index (assuming HV >= H and they're grouped)
-    H = key_dim // K
-    pid_h = pid_hv * H // HV  # key head index
-    
-    # Load conv state index
-    conv_idx = tl.load(conv_state_indices + pid_b).to(tl.int64)
-    if conv_idx < 0:  # PAD_SLOT_ID
-        return
-    
-    # ============================================================
-    # Step 1: Causal Conv1D Update
-    # ============================================================
-    # We process K, K (for q and k), and V dimensions separately
-    # This is for single token, so we use sliding window convolution
-    
-    o_k = tl.arange(0, BK)
-    o_v = tl.arange(0, BV)
+
+    o_k = i_k * BK + tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+
+    p_q = qkv + bos * stride_qkv_l + ((i_h * K) + o_k) * stride_qkv_hd
+    p_k = qkv + bos * stride_qkv_l + (H * K + (i_h * K) + o_k) * stride_qkv_hd
+    p_v = qkv + bos * stride_qkv_l + (2 * H * K + (i_hv * V) + o_v) * stride_qkv_hd
+
+    #p_q = q + (bos * H + i_h) * K + o_k
+    #p_k = k + (bos * H + i_h) * K + o_k
+    #p_v = v + (bos * HV + i_hv) * V + o_v
+    if IS_BETA_HEADWISE:
+        p_beta = beta + (bos * HV + i_hv) * V + o_v
+    else:
+        p_beta = beta + bos * HV + i_hv
+
+    if not IS_KDA:
+        p_g = g + bos * HV + i_hv
+    else:
+        p_gk = g + (bos * HV + i_hv) * K + o_k
+
+    p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
+
     mask_k = o_k < K
     mask_v = o_v < V
-    
-    # Pointers to qkv input for this batch
-    p_q_in = qkv + pid_b * stride_qkv_b + (pid_h * K + o_k) * stride_qkv_d
-    p_k_in = qkv + pid_b * stride_qkv_b + (key_dim + pid_h * K + o_k) * stride_qkv_d
-    p_v_in = qkv + pid_b * stride_qkv_b + (key_dim * 2 + pid_hv * V + o_v) * stride_qkv_d
-    
-    # Base pointer to conv state for this sequence
-    p_conv_base = (
-        conv_state + conv_idx * stride_conv_state_seq
-    )
-    
-    # ============================================================
-    # Apply Conv1D to Q, K, V using the separate function
-    # ============================================================
-    b_q = _apply_conv1d(
-        p_q_in,
-        p_conv_base,
-        conv_weight,
-        conv_bias,
-        pid_h * K + o_k,
-        mask_k,
-        stride_conv_state_dim,
-        stride_conv_state_tok,
-        stride_conv_weight_dim,
-        stride_conv_weight_w,
-        HAS_BIAS,
-        SILU_ACTIVATION,
-        BK,
-        CONV_WIDTH,
-        STATE_LEN,
-    )
-    
-    b_k = _apply_conv1d(
-        p_k_in,
-        p_conv_base,
-        conv_weight,
-        conv_bias,
-        key_dim + pid_h * K + o_k,
-        mask_k,
-        stride_conv_state_dim,
-        stride_conv_state_tok,
-        stride_conv_weight_dim,
-        stride_conv_weight_w,
-        HAS_BIAS,
-        SILU_ACTIVATION,
-        BK,
-        CONV_WIDTH,
-        STATE_LEN,
-    )
-    
-    b_v = _apply_conv1d(
-        p_v_in,
-        p_conv_base,
-        conv_weight,
-        conv_bias,
-        key_dim * 2 + pid_hv * V + o_v,
-        mask_v,
-        stride_conv_state_dim,
-        stride_conv_state_tok,
-        stride_conv_weight_dim,
-        stride_conv_weight_w,
-        HAS_BIAS,
-        SILU_ACTIVATION,
-        BV,
-        CONV_WIDTH,
-        STATE_LEN,
-    )
-    
-    # ============================================================
-    # Step 2: QK L2 Normalization (optional)
-    # ============================================================
-    if USE_QK_L2NORM:
-        q_norm = tl.sqrt(tl.sum(b_q * b_q, axis=0) + 1e-6)
-        k_norm = tl.sqrt(tl.sum(b_k * b_k, axis=0) + 1e-6)
-        b_q = b_q / q_norm
-        b_k = b_k / k_norm
-    
-    # Apply scale to query
-    b_q = b_q * scale
-    
-    # ============================================================
-    # Step 3: Recurrent Gated Delta Rule Update
-    # ============================================================
-    # Load SSM state for this head
-    ssm_idx = tl.load(ssm_state_indices + pid_b).to(tl.int64)
-    if ssm_idx < 0:  # PAD_SLOT_ID
-        return
-    
-    p_h = (
-        ssm_state 
-        + ssm_idx * stride_ssm_n
-        + pid_hv * stride_ssm_h
-        + o_v[:, None] * stride_ssm_v
-        + o_k[None, :] * stride_ssm_k
-    )
-    
     mask_h = mask_v[:, None] & mask_k[None, :]
-    b_h = tl.load(p_h, mask=mask_h, other=0.0).to(tl.float32)
-    
-    # Load gating and beta
-    b_g = tl.load(g + pid_b * stride_g_b + pid_hv * stride_g_h).to(tl.float32)
-    b_beta = tl.load(beta + pid_b * stride_beta_b + pid_hv * stride_beta_h).to(tl.float32)
-    
-    # Apply gated delta rule update
-    # h *= exp(g)
-    b_h = b_h * tl.exp(b_g)
-    
-    # v -= sum(h * k, dim=K)
-    b_v_update = b_v - tl.sum(b_h * b_k[None, :], axis=1)
-    b_v_update = b_v_update * b_beta
-    
-    # h += v[:, None] * k[None, :]
-    b_h = b_h + b_v_update[:, None] * b_k[None, :]
-    
-    # o = sum(h * q, dim=K)
-    b_o = tl.sum(b_h * b_q[None, :], axis=1)
-    
-    # ============================================================
-    # Step 4: Store outputs
-    # ============================================================
-    # Store output
-    p_o = output + pid_b * stride_o_b + pid_hv * stride_o_h + o_v * stride_o_v
-    tl.store(p_o, b_o.to(output.dtype.element_ty), mask=mask_v)
-    
-    # Store updated SSM state
-    tl.store(p_h, b_h.to(ssm_state.dtype.element_ty), mask=mask_h)
+
+    b_h = tl.zeros([BV, BK], dtype=tl.float32)
+    if USE_INITIAL_STATE:
+        if IS_CONTINUOUS_BATCHING:
+            if IS_SPEC_DECODING:
+                i_t = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
+            else:
+                i_t = 0
+            # Load state index and check for PAD_SLOT_ID (-1)
+            state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(
+                tl.int64
+            )
+            # Skip if state index is invalid (PAD_SLOT_ID = -1)
+            if state_idx < 0:
+                return
+            p_h0 = h0 + state_idx * stride_init_state_token
+        else:
+            p_h0 = h0 + bos * HV * V * K
+        p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+        b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+
+    for i_t in range(0, T):
+        # load and do causal_conv1d_update
+        idx_seq = bos + i_t
+        b_q = tl.load(p_q, mask=mask_k, other=0) # [np2_K,]
+        idx_feats = i_h * K + o_k
+        b_q = _causal_conv1d_update_inner_kernel(
+            b_q,
+            weight,
+            bias,
+            conv_state,
+            conv_state_indices,
+            None, # num_accepted_tokens
+            None, # query_start_loc_ptr
+            None, # block_idx_last_scheduled_token
+            None, # initial_state_idx
+            idx_seq,
+            idx_feats,
+            mask_k,
+            state_len,
+            num_cache_lines,
+            stride_w_dim,
+            stride_w_width,
+            stride_conv_state_seq,
+            stride_conv_state_dim,
+            stride_conv_state_tok,
+            stride_state_indices,
+            pad_slot_id,
+            HAS_BIAS,
+            KERNEL_WIDTH,
+            SILU_ACTIVATION,
+            NP2_STATELEN,
+            USE_PAD_SLOT
+        )
+        b_q = b_q.to(tl.float32)
+
+        b_k = tl.load(p_k, mask=mask_k, other=0) # [np2_K,]
+        idx_feats = H * K + (i_h * K) + o_k
+        b_k = _causal_conv1d_update_inner_kernel(
+            b_k,
+            weight,
+            bias,
+            conv_state,
+            conv_state_indices,
+            None, # num_accepted_tokens
+            None, # query_start_loc_ptr
+            None, # block_idx_last_scheduled_token
+            None, # initial_state_idx
+            idx_seq,
+            idx_feats,
+            mask_k,
+            state_len,
+            num_cache_lines,
+            stride_w_dim,
+            stride_w_width,
+            stride_conv_state_seq,
+            stride_conv_state_dim,
+            stride_conv_state_tok,
+            stride_state_indices,
+            pad_slot_id,
+            HAS_BIAS,
+            KERNEL_WIDTH,
+            SILU_ACTIVATION,
+            NP2_STATELEN,
+            USE_PAD_SLOT
+        )
+        b_k = b_k.to(tl.float32)
+
+        b_v = tl.load(p_v, mask=mask_v, other=0) # [32,]
+        idx_feats = 2 * H * K + (i_hv * V) + o_v
+        b_v = _causal_conv1d_update_inner_kernel(
+            b_v,
+            weight,
+            bias,
+            conv_state,
+            conv_state_indices,
+            None, # num_accepted_tokens
+            None, # query_start_loc_ptr
+            None, # block_idx_last_scheduled_token
+            None, # initial_state_idx
+            idx_seq,
+            idx_feats,
+            mask_v,
+            state_len,
+            num_cache_lines,
+            stride_w_dim,
+            stride_w_width,
+            stride_conv_state_seq,
+            stride_conv_state_dim,
+            stride_conv_state_tok,
+            stride_state_indices,
+            pad_slot_id,
+            HAS_BIAS,
+            KERNEL_WIDTH,
+            SILU_ACTIVATION,
+            NP2_STATELEN,
+            USE_PAD_SLOT
+        )
+        b_v = b_v.to(tl.float32)
+
+        if USE_QK_L2NORM_IN_KERNEL:
+            b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+            b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+        b_q = b_q * scale
+        # [BV, BK]
+        if not IS_KDA:
+            b_g = tl.load(p_g).to(tl.float32)
+            b_h *= exp(b_g)
+        else:
+            b_gk = tl.load(p_gk).to(tl.float32)
+            b_h *= exp(b_gk[None, :])
+        # [BV]
+        b_v -= tl.sum(b_h * b_k[None, :], 1)
+        if IS_BETA_HEADWISE:
+            b_beta = tl.load(p_beta, mask=mask_v, other=0).to(tl.float32)
+        else:
+            b_beta = tl.load(p_beta).to(tl.float32)
+        b_v *= b_beta
+        # [BV, BK]
+        b_h += b_v[:, None] * b_k[None, :]
+        # [BV]
+        b_o = tl.sum(b_h * b_q[None, :], 1)
+        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+
+        # keep the states for multi-query tokens
+        if INPLACE_FINAL_STATE:
+            # Load state index and check for PAD_SLOT_ID (-1)
+            final_state_idx = tl.load(
+                ssm_state_indices + i_n * stride_indices_seq + i_t
+            ).to(tl.int64)
+            # Only store if state index is valid (not PAD_SLOT_ID)
+            if final_state_idx >= 0:
+                p_ht = ht + final_state_idx * stride_final_state_token
+                p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+                tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+        else:
+            p_ht = ht + (bos + i_t) * stride_final_state_token
+            p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+            tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+
+        p_q += stride_qkv_l
+        p_k += stride_qkv_l
+        p_v += stride_qkv_l
+
+        #p_q += H * K
+        #p_k += H * K
+        p_o += HV * V
+        #p_v += HV * V
+        if not IS_KDA:
+            p_g += HV
+        else:
+            p_gk += HV * K
+        p_beta += HV * (V if IS_BETA_HEADWISE else 1)
+
 
 
 def fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    num_actual_tokens: int,
-    conv_state: torch.Tensor,  ## for conv1d
-    weight: torch.Tensor,  ## for conv1d
-    bias: torch.Tensor | None,  ## for conv1d
-    activation: bool | str | None,  ## for conv1d
-    conv_state_indices: torch.Tensor | None,  ## for conv1d
-    validate_data,  ## for conv1d
+    ## for conv1d
+    qkv: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    ## for gated delta rule
     g: torch.Tensor,
     key_dim: int,
     value_dim: int,
@@ -603,6 +500,16 @@ def fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule(
     ssm_state_indices: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
+    ## for conv1d (with default values)
+    bias: torch.Tensor | None = None,
+    activation: bool | str | None = None,
+    conv_state_indices: torch.Tensor | None = None,
+    query_start_loc: torch.Tensor | None = None,
+    max_query_len: int = -1,
+    pad_slot_id: int = PAD_SLOT_ID,
+    block_idx_last_scheduled_token: torch.Tensor | None = None,
+    initial_state_idx: torch.Tensor | None = None,
+    validate_data=False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Fused kernel that combines:
@@ -613,8 +520,11 @@ def fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule(
     Uses a single Triton kernel for decode-only path, falls back to sequential for prefill.
     
     Args:
-        q, k, v: Query, key, value tensors of shape [num_tokens, key_dim//tp_size], etc.
-        num_actual_tokens: Number of valid tokens in the batch
+        qkv (torch.Tensor):
+            mixed qkv of shape: `[L, H_qk*D_qk + H_qk*D_qk + H_v*D_v]`.
+            queries of shape `[L, H_qk*D_qk]`.
+            keys of shape    `[L, H_qk*D_qk]`.
+            values of shape  `[L, H_v*D_v]`.
         conv_state: Convolution state cache
         weight: Conv1d weight
         bias: Conv1d bias
@@ -637,142 +547,155 @@ def fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule(
         output: Attention output
         final_state: Updated SSM state
     """
-    batch_size = num_actual_tokens
+    ## for conv1d
+    if validate_data:
+        assert pad_slot_id is not None
+        assert qkv.stride(1) == 1
+    if isinstance(activation, bool):
+        activation = "silu" if activation is True else None
+    elif activation is not None:
+        assert activation in ["silu", "swish"]
+
+    qkv = qkv.to(conv_state.dtype)
+
+    batch, dim = qkv.shape
+    _, width = weight.shape
+    num_cache_lines, _, state_len = conv_state.size()
+    if validate_data:
+        assert dim == weight.size(0)
+        assert conv_state.stride(-2) == 1, (
+            f"ERROR: expect contiguous along feat-dim of conv_state (currently stride={conv_state.stride()})"
+        )
+        assert state_len >= width - 1
+        # when above happens, we don't shift-left to keep any records in conv_state
+        assert dim == conv_state.size(1)
+        if conv_state_indices is None:
+            assert conv_state.size(0) >= batch
+        else:
+            assert (batch,) == conv_state_indices.shape
+
+        assert num_cache_lines >= batch
+        assert weight.stride(1) == 1  # Need this
+
+    stride_w_dim, stride_w_width = weight.stride()
+
+    stride_istate_seq, stride_istate_dim, stride_istate_token = conv_state.stride()
+    stride_state_indices = (
+        conv_state_indices.stride(0) if conv_state_indices is not None else 0
+    )
+    assert num_accepted_tokens is None, "num_accepted_tokens should be None in the fused kernel"
+    state_len = width - 1
+    np2_statelen = triton.next_power_of_2(state_len)
+
+    ## for gated delta rule
+    expected_shape = (qkv.shape[0], key_dim * 2 + value_dim)
+    assert qkv.shape == expected_shape, f"expect qkv to be in shape {expected_shape}, got {qkv.shape}"
+    if scale is None:
+        scale = head_k_dim ** -0.5
+        #scale = k.shape[-1] ** -0.5
+    else:
+        assert scale > 0, "scale must be positive"
+    if beta is None:
+        h_q = key_dim // head_k_dim
+        beta = torch.ones([1, qkv.shape[0], h_q], dtype=qkv.dtype, device=qkv.device)
+
+    # decode-only mode (single token per sequence)
+    assert (
+        cu_seqlens is not None 
+        and batch == len(cu_seqlens) - 1
+        and all((cu_seqlens[i+1] - cu_seqlens[i]) == 1 for i in range(batch))
+    ), f"cu_seqlens {str(cu_seqlens)} is not compatible for decode mode"
+    
+    B = 1
+    T = qkv.shape[0]
     H = key_dim // head_k_dim
     HV = value_dim // head_v_dim
     K = head_k_dim
     V = head_v_dim
-    
-    if scale is None:
-        scale = K ** -0.5
-    
-    # Determine if we're in decode-only mode (single token per sequence)
-    is_decode_only = (
-        cu_seqlens is not None 
-        and batch_size == len(cu_seqlens) - 1
-        and all((cu_seqlens[i+1] - cu_seqlens[i]) == 1 for i in range(batch_size))
-    )
-    
-    # For decode-only path with single tokens, use fused Triton kernel
-    if is_decode_only and batch_size > 0:
-        # Prepare input (concatenate q, k, v)
-        mixed_qkv = torch.cat((q, k, v), dim=-1)
-        mixed_qkv = mixed_qkv[:num_actual_tokens]
-        
-        # Prepare output
-        output = torch.empty(
-            (batch_size, HV, V),
-            dtype=q.dtype, 
-            device=q.device
-        )
-        
-        # Setup kernel launch parameters
-        conv_width = weight.shape[1]
-        state_len = conv_state.shape[2]
-        
-        BK = triton.next_power_of_2(K)
-        BV = min(triton.next_power_of_2(V), 32)
-        
-        grid = (batch_size, HV)
-        
-        # Launch fused kernel
-        _fused_conv1d_recurrent_decode_kernel[grid](
-            # Inputs
-            mixed_qkv,
-            conv_state,
-            weight,
-            bias,
-            g,
-            beta,
-            conv_state_indices,
-            # Outputs
-            output,
-            initial_state,  # SSM state (will be updated in-place)
-            ssm_state_indices,
-            # Dimensions
-            batch_size,
-            key_dim,
-            value_dim,
-            HV,
-            K,
-            V,
-            scale,
-            # Strides - qkv
-            mixed_qkv.stride(0),
-            mixed_qkv.stride(1),
-            # Strides - conv_state
-            conv_state.stride(0),
-            conv_state.stride(1),
-            conv_state.stride(2),
-            # Strides - conv_weight
-            weight.stride(0),
-            weight.stride(1),
-            # Strides - g, beta
-            g.stride(1),
-            g.stride(2),
-            beta.stride(1),
-            beta.stride(2),
-            # Strides - output
-            output.stride(0),
-            output.stride(1),
-            output.stride(2),
-            # Strides - SSM state
-            initial_state.stride(0),
-            initial_state.stride(1),
-            initial_state.stride(2),
-            initial_state.stride(3),
-            # Meta params
-            HAS_BIAS=(bias is not None),
-            SILU_ACTIVATION=(activation in ['silu', 'swish']),
-            USE_QK_L2NORM=use_qk_l2norm_in_kernel,
-            BK=BK,
-            BV=BV,
-            CONV_WIDTH=conv_width,
-            STATE_LEN=state_len,
-            num_warps=4,
-            num_stages=2,
-        )
-        
-        # Reshape output to match expected format: [1, L, HV, V]
-        output = output.view(1, batch_size, HV, V)
-        return output, initial_state
-    
+    #B, T, H, K, V = *k.shape, v.shape[-1]
+    #HV = v.shape[2]
+    N = B if cu_seqlens is None else len(cu_seqlens) - 1
+    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
+    NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
+    assert NK == 1, "NK > 1 is not supported yet"
+    num_stages = 3
+    num_warps = 1
+
+    #o = q.new_empty(NK, *v.shape)
+    o = qkv.new_empty(NK, B, T, HV, V)
+    if inplace_final_state:
+        final_state = initial_state
     else:
-        # For prefill or multi-token decode, fall back to sequential kernels
-        # This path handles variable-length sequences and multi-token processing
-        
-        # Step 1: Concatenate q, k, v to create mixed_qkv
-        mixed_qkv = torch.cat((q, k, v), dim=-1)
-        mixed_qkv_sliced = mixed_qkv[:num_actual_tokens]
-        
-        # Step 2: Apply causal conv1d update
-        mixed_qkv_conv = causal_conv1d_update(
-            mixed_qkv_sliced,
-            conv_state,
-            weight,
-            bias,
-            activation,
-            conv_state_indices=conv_state_indices,
-            validate_data=validate_data,
-        )
-        
-        # Step 3: Apply rearrange + gated delta rule
-        output, final_state = fused_rearrange_recurrent_gated_delta_rule(
-            qkv=mixed_qkv_conv,
-            g=g,
-            key_dim=key_dim,
-            value_dim=value_dim,
-            head_k_dim=head_k_dim,
-            head_v_dim=head_v_dim,
-            beta=beta,
-            scale=scale,
-            initial_state=initial_state,
-            inplace_final_state=inplace_final_state,
-            cu_seqlens=cu_seqlens,
-            ssm_state_indices=ssm_state_indices,
-            num_accepted_tokens=num_accepted_tokens,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-        )
-        
-        return output, final_state
+        final_state = qkv.new_empty(T, HV, V, K, dtype=initial_state.dtype)
+
+    stride_init_state_token = initial_state.stride(0)
+    stride_final_state_token = final_state.stride(0)
+
+    if ssm_state_indices is None:
+        stride_indices_seq, stride_indices_tok = 1, 1
+    elif ssm_state_indices.ndim == 1:
+        stride_indices_seq, stride_indices_tok = ssm_state_indices.stride(0), 1
+    else:
+        stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
+
+    stride_qkv_l, stride_qkv_hd = qkv.stride()
+
+    grid = (NK, NV, N * HV)
+    fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule_kernel[grid](
+        qkv=qkv,
+        ## for conv1d
+        weight=weight,
+        bias=bias,
+        conv_state=conv_state,
+        conv_state_indices=conv_state_indices,
+        state_len=state_len,
+        num_cache_lines=num_cache_lines,
+        stride_w_dim=stride_w_dim,
+        stride_w_width=stride_w_width,
+        stride_conv_state_seq=stride_istate_seq,
+        stride_conv_state_dim=stride_istate_dim,
+        stride_conv_state_tok=stride_istate_token,
+        stride_state_indices=stride_state_indices,
+        pad_slot_id=pad_slot_id,
+        ## for gated delta rule
+        g=g,
+        beta=beta,
+        o=o,
+        h0=initial_state,
+        ht=final_state,
+        cu_seqlens=cu_seqlens,
+        ssm_state_indices=ssm_state_indices,
+        num_accepted_tokens=num_accepted_tokens,
+        scale=scale,
+        N=N,
+        T=T,
+        B=B,
+        H=H,
+        HV=HV,
+        K=K,
+        V=V,
+        BK=BK,
+        BV=BV,
+        stride_qkv_l=stride_qkv_l,
+        stride_qkv_hd=stride_qkv_hd,
+        stride_init_state_token=stride_init_state_token,
+        stride_final_state_token=stride_final_state_token,
+        stride_indices_seq=stride_indices_seq,
+        stride_indices_tok=stride_indices_tok,
+        IS_BETA_HEADWISE=beta.ndim == 4, # v.ndim
+        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        INPLACE_FINAL_STATE=inplace_final_state,
+        IS_KDA=False,
+        # for conv1d META
+        HAS_BIAS=bias is not None,
+        KERNEL_WIDTH=width,
+        SILU_ACTIVATION=activation in ["silu", "swish"],
+        NP2_STATELEN=np2_statelen,
+        USE_PAD_SLOT=pad_slot_id is not None,
+        # others
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    o = o.squeeze(0)
+    return o, final_state
 

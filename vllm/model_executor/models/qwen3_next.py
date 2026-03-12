@@ -842,20 +842,30 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 """
                 mixed_qkv = torch.cat((q, k, v), dim=-1)
                 mixed_qkv_non_spec = mixed_qkv[:num_actual_tokens]
-                mixed_qkv_non_spec = causal_conv1d_update(
-                    mixed_qkv_non_spec,
-                    conv_state,
-                    conv_weights,
-                    self.conv1d.bias,
-                    self.activation,
-                    conv_state_indices=non_spec_state_indices_tensor[
-                        : attn_metadata.num_actual_tokens
-                    ],
-                    validate_data=True,
-                )
+                #mixed_qkv_non_spec = causal_conv1d_update(
+                #    mixed_qkv_non_spec,
+                #    conv_state,
+                #    conv_weights,
+                #    self.conv1d.bias,
+                #    self.activation,
+                #    conv_state_indices=non_spec_state_indices_tensor[
+                #        : attn_metadata.num_actual_tokens
+                #    ],
+                #    validate_data=True,
+                #)
                 core_attn_out_non_spec, last_recurrent_state = (
-                    fused_rearrange_recurrent_gated_delta_rule(
+                    fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule(
+                        ## for conv1d
                         qkv=mixed_qkv_non_spec,
+                        conv_state=conv_state,
+                        weight=conv_weights,
+                        bias=self.conv1d.bias,
+                        activation=self.activation,
+                        conv_state_indices=non_spec_state_indices_tensor[
+                            : attn_metadata.num_actual_tokens
+                        ],
+                        validate_data=True,
+                        ## now for rearrange and gated delta rule
                         g=g_non_spec,
                         key_dim=self.key_dim // self.tp_size,
                         value_dim=self.value_dim // self.tp_size,
