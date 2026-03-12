@@ -123,9 +123,9 @@ def fused_rearrange_recurrent_gated_delta_rule_fwd_kernel(
         b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
     for i_t in range(0, T):
-        b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
-        b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
-        b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
+        b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32) # [np2_K,]
+        b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32) # [np2_K,]
+        b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32) # [32,]
 
         if USE_QK_L2NORM_IN_KERNEL:
             b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)

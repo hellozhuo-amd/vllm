@@ -880,13 +880,13 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 #        v=v,
                 #        num_actual_tokens=num_actual_tokens,
                 #        conv_state=conv_state,
-                #        weights=conv_weights,
+                #        weight=conv_weights,
                 #        bias=self.conv1d.bias,
-                #        activateion=self.activation,
+                #        activation=self.activation,
                 #        conv_state_indices=non_spec_state_indices_tensor[
                 #            : attn_metadata.num_actual_tokens
                 #        ],
-                #        conv_validate_data=True,
+                #        validate_data=True,
                 #        g=g_non_spec,
                 #        key_dim=self.key_dim // self.tp_size,
                 #        value_dim=self.value_dim // self.tp_size,
