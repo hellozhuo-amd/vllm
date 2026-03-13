@@ -94,6 +94,9 @@ def _causal_conv1d_update_inner_kernel(
         #if query_start_index == query_end_index:
         #    return
 
+        original_x_dtype = loaded_x.dtype
+        loaded_x = loaded_x.to(conv_state_ptr.type.element_ty)
+
         # IS_SPEC_DECODING is False
         conv_state_token_offset = 0
 
@@ -181,7 +184,7 @@ def _causal_conv1d_update_inner_kernel(
         w_last_ptrs = w_ptr + (idx_feats * stride_w_dim) + (KERNEL_WIDTH - 1) * stride_w_width
         w_last = tl.load(w_last_ptrs, mask_feats, other=0.0) # [x_dim]
 
-        acc = (tl.sum(w_cols * cols, axis=1) + w_last * loaded_x).to(tl.float32)
+        acc = tl.sum((w_cols * cols).to(tl.float32), axis=1) + (w_last * loaded_x).to(tl.float32)
 
         if HAS_BIAS:
             bias = bias_ptr + idx_feats
@@ -191,6 +194,8 @@ def _causal_conv1d_update_inner_kernel(
 
         if SILU_ACTIVATION:
             acc = acc / (1 + tl.exp(-acc))
+
+        acc = acc.to(original_x_dtype).to(tl.float32)
 
     return acc
 
@@ -551,8 +556,6 @@ def fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule(
         activation = "silu" if activation is True else None
     elif activation is not None:
         assert activation in ["silu", "swish"]
-
-    qkv = qkv.to(conv_state.dtype)
 
     batch, dim = qkv.shape
     _, width = weight.shape
