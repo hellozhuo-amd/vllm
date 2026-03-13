@@ -81,117 +81,116 @@ def _causal_conv1d_update_inner_kernel(
         conv_state_indices_ptr + idx_seq * stride_state_indices + conv_state_init
     ).to(tl.int64)
 
-    if USE_PAD_SLOT:  # noqa
-        if conv_states_input_coord == pad_slot_id:
-            # not processing as this is not the actual sequence
-            return loaded_x.to(tl.float32)
+    if USE_PAD_SLOT and conv_states_input_coord == pad_slot_id:  # noqa
+        acc = loaded_x.to(tl.float32)
 
-    # IS_VARLEN is False
-    #query_start_index = idx_seq * seqlen
-    #query_end_index = query_start_index + seqlen
-    #x_offset = idx_seq * stride_x_seq
-    #o_offset = idx_seq * stride_o_seq
+    else:
+        # IS_VARLEN is False
+        #query_start_index = idx_seq * seqlen
+        #query_end_index = query_start_index + seqlen
+        #x_offset = idx_seq * stride_x_seq
+        #o_offset = idx_seq * stride_o_seq
 
-    #if query_start_index == query_end_index:
-    #    return
+        #if query_start_index == query_end_index:
+        #    return
 
-    # IS_SPEC_DECODING is False
-    conv_state_token_offset = 0
+        # IS_SPEC_DECODING is False
+        conv_state_token_offset = 0
 
-    # STEP 1: READ init_state data
-    # note: NP2_STATELEN = triton.next_power_of_2(KERNEL_WIDTH - 1)
-    idx_cols = tl.arange(0, NP2_STATELEN)
-    conv_state_ptrs_cols = (
-        conv_state_ptr
-        + (conv_states_input_coord * stride_conv_state_seq)
-        + conv_state_token_offset * stride_conv_state_tok
-        + (idx_feats * stride_conv_state_dim)[:, None]
-        + (idx_cols * stride_conv_state_tok)[None, :]
-    )  # [x_dim, NP2_STATELEN]
-    mask_cols = (
-        (conv_states_input_coord < num_cache_lines)
-        & mask_feats[:, None]
-        & (idx_cols < KERNEL_WIDTH - 1)[None, :]
-    )
-    cols = tl.load(conv_state_ptrs_cols, mask_cols, other=0.0)
+        # STEP 1: READ init_state data
+        # note: NP2_STATELEN = triton.next_power_of_2(KERNEL_WIDTH - 1)
+        idx_cols = tl.arange(0, NP2_STATELEN)
+        conv_state_ptrs_cols = (
+            conv_state_ptr
+            + (conv_states_input_coord * stride_conv_state_seq)
+            + conv_state_token_offset * stride_conv_state_tok
+            + (idx_feats * stride_conv_state_dim)[:, None]
+            + (idx_cols * stride_conv_state_tok)[None, :]
+        )  # [x_dim, NP2_STATELEN]
+        mask_cols = (
+            (conv_states_input_coord < num_cache_lines)
+            & mask_feats[:, None]
+            & (idx_cols < KERNEL_WIDTH - 1)[None, :]
+        )
+        cols = tl.load(conv_state_ptrs_cols, mask_cols, other=0.0)
 
-    # STEP 2: assume state_len > seqlen
-    idx_tokens = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
+        # STEP 2: assume state_len > seqlen
+        idx_tokens = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
 
-    # With speculative decoding, the conv_state updates works in a sliding
-    # window manner, at each forward pass, the tokens are shift by 1, so we
-    # load since idx_tokens + 1.
-    conv_state_ptrs_source = (
-        conv_state_ptr
-        + (conv_states_input_coord * stride_conv_state_seq)
-        + conv_state_token_offset * stride_conv_state_tok
-        + (idx_feats * stride_conv_state_dim)[None, :]
-        + ((idx_tokens + seqlen) * stride_conv_state_tok)[
-            :, None
-        ]
-    )  # [BLOCK_M, x_dim]
-    mask = (
-        (conv_states_input_coord < num_cache_lines)
-        & ((idx_tokens + seqlen) < state_len)[:, None]
-        & mask_feats[None, :]
-    )
-    conv_state = tl.load(conv_state_ptrs_source, mask, other=0.0)
+        # With speculative decoding, the conv_state updates works in a sliding
+        # window manner, at each forward pass, the tokens are shift by 1, so we
+        # load since idx_tokens + 1.
+        conv_state_ptrs_source = (
+            conv_state_ptr
+            + (conv_states_input_coord * stride_conv_state_seq)
+            + conv_state_token_offset * stride_conv_state_tok
+            + (idx_feats * stride_conv_state_dim)[None, :]
+            + ((idx_tokens + seqlen) * stride_conv_state_tok)[
+                :, None
+            ]
+        )  # [BLOCK_M, x_dim]
+        mask = (
+            (conv_states_input_coord < num_cache_lines)
+            & ((idx_tokens + seqlen) < state_len)[:, None]
+            & mask_feats[None, :]
+        )
+        conv_state = tl.load(conv_state_ptrs_source, mask, other=0.0)
 
-    #VAL = state_len - seqlen
-    #x_base = x_ptr + x_offset + (idx_feats * stride_x_dim)  # [BLOCK_N]
+        #VAL = state_len - seqlen
+        #x_base = x_ptr + x_offset + (idx_feats * stride_x_dim)  # [BLOCK_N]
 
-    #x_ptrs = (
-    #    x_base[None, :] + ((idx_tokens - VAL) * stride_x_token)[:, None]
-    #)  # [BLOCK_M, BLOCK_N]
+        #x_ptrs = (
+        #    x_base[None, :] + ((idx_tokens - VAL) * stride_x_token)[:, None]
+        #)  # [BLOCK_M, BLOCK_N]
 
-    #mask_x = (
-    #    (idx_tokens - VAL >= 0)[:, None]
-    #    & (idx_tokens - VAL < seqlen)[:, None]
-    #    & (idx_feats < dim)[None, :]
-    #)  # token-index  # token-index  # feature-index
-    #loaded_x = tl.load(x_ptrs, mask_x, 0.0)
-    tl.debug_barrier()
+        #mask_x = (
+        #    (idx_tokens - VAL >= 0)[:, None]
+        #    & (idx_tokens - VAL < seqlen)[:, None]
+        #    & (idx_feats < dim)[None, :]
+        #)  # token-index  # token-index  # feature-index
+        #loaded_x = tl.load(x_ptrs, mask_x, 0.0)
+        tl.debug_barrier()
 
-    new_conv_state = tl.where(mask, conv_state, loaded_x[None, :])
+        new_conv_state = tl.where(mask, conv_state, loaded_x[None, :])
 
-    # Get the state from the initial_state_idx
-    # cache_idx
-    conv_states_offset = tl.load(
-        conv_state_indices_ptr + idx_seq * stride_state_indices + current_last_index
-    ).to(tl.int64)
-    conv_state_ptrs_target = (
-        conv_state_ptr
-        + (conv_states_offset * stride_conv_state_seq)  # Offset from seq
-        + (idx_feats * stride_conv_state_dim)
-    )[None, :] + (  # [,x_dim]
-        idx_tokens * stride_conv_state_tok
-    )[:, None]
-    mask = (idx_tokens < state_len)[:, None] & mask_feats[None, :]
-    tl.store(conv_state_ptrs_target, new_conv_state, mask)
+        # Get the state from the initial_state_idx
+        # cache_idx
+        conv_states_offset = tl.load(
+            conv_state_indices_ptr + idx_seq * stride_state_indices + current_last_index
+        ).to(tl.int64)
+        conv_state_ptrs_target = (
+            conv_state_ptr
+            + (conv_states_offset * stride_conv_state_seq)  # Offset from seq
+            + (idx_feats * stride_conv_state_dim)
+        )[None, :] + (  # [,x_dim]
+            idx_tokens * stride_conv_state_tok
+        )[:, None]
+        mask = (idx_tokens < state_len)[:, None] & mask_feats[None, :]
+        tl.store(conv_state_ptrs_target, new_conv_state, mask)
 
-    # STEP 3: init accumulator, not necessary
+        # STEP 3: init accumulator, not necessary
 
-    # STEP 4:
-    # PRE-LOAD WEIGHTS
-    # first kernel column, configured for weights to handle BLOCK_N features in range
+        # STEP 4:
+        # PRE-LOAD WEIGHTS
+        # first kernel column, configured for weights to handle BLOCK_N features in range
 
-    w_cols_ptrs = w_ptr + (idx_feats * stride_w_dim)[:, None] + (idx_cols * stride_w_width)[None, :]
-    mask_w_cols = mask_feats[:, None] & (idx_cols < KERNEL_WIDTH - 1)[None, :]
-    w_cols = tl.load(w_cols_ptrs, mask_w_cols, other=0.0)  # [x_dim, NP2_STATELEN]
+        w_cols_ptrs = w_ptr + (idx_feats * stride_w_dim)[:, None] + (idx_cols * stride_w_width)[None, :]
+        mask_w_cols = mask_feats[:, None] & (idx_cols < KERNEL_WIDTH - 1)[None, :]
+        w_cols = tl.load(w_cols_ptrs, mask_w_cols, other=0.0)  # [x_dim, NP2_STATELEN]
 
-    w_last_ptrs = w_ptr + (idx_feats * stride_w_dim) + (KERNEL_WIDTH - 1) * stride_w_width
-    w_last = tl.load(w_last_ptrs, mask_feats, other=0.0) # [x_dim]
+        w_last_ptrs = w_ptr + (idx_feats * stride_w_dim) + (KERNEL_WIDTH - 1) * stride_w_width
+        w_last = tl.load(w_last_ptrs, mask_feats, other=0.0) # [x_dim]
 
-    acc = (tl.sum(w_cols * cols, axis=1) + w_last * loaded_x).to(tl.float32)
+        acc = (tl.sum(w_cols * cols, axis=1) + w_last * loaded_x).to(tl.float32)
 
-    if HAS_BIAS:
-        bias = bias_ptr + idx_feats
-        acc += tl.load(bias, mask=mask_feats, other=0.0).to(
-            tl.float32
-        )  # [x_dim]
+        if HAS_BIAS:
+            bias = bias_ptr + idx_feats
+            acc += tl.load(bias, mask=mask_feats, other=0.0).to(
+                tl.float32
+            )  # [x_dim]
 
-    if SILU_ACTIVATION:
-        acc = acc / (1 + tl.exp(-acc))
+        if SILU_ACTIVATION:
+            acc = acc / (1 + tl.exp(-acc))
 
     return acc
 
@@ -359,7 +358,6 @@ def fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule_kernel(
             NP2_STATELEN,
             USE_PAD_SLOT
         )
-        b_q = b_q.to(tl.float32)
 
         b_k = tl.load(p_k, mask=mask_k, other=0) # [np2_K,]
         idx_feats = H * K + (i_h * K) + o_k
@@ -391,7 +389,6 @@ def fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule_kernel(
             NP2_STATELEN,
             USE_PAD_SLOT
         )
-        b_k = b_k.to(tl.float32)
 
         b_v = tl.load(p_v, mask=mask_v, other=0) # [32,]
         idx_feats = 2 * H * K + (i_hv * V) + o_v
@@ -423,7 +420,6 @@ def fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule_kernel(
             NP2_STATELEN,
             USE_PAD_SLOT
         )
-        b_v = b_v.to(tl.float32)
 
         if USE_QK_L2NORM_IN_KERNEL:
             b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
