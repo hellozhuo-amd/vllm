@@ -42,36 +42,35 @@ def compare_accuracy(current, reference):
 def test(ipath, opath):
 
     inputs = torch.load(ipath)
-    outputs = torch.load(opath)
-
-    # mixed_qkv_non_spec = causal_conv1d_update(
-    #     inputs["qkv"],
-    #     inputs["conv_state"],
-    #     inputs["weight"],
-    #     inputs["bias"],
-    #     inputs["activation"],
-    #     conv_state_indices=inputs["conv_state_indices"],
-    #     validate_data=inputs["validate_data"],
-    # )
-    # out1, out2 = (
-    #     fused_rearrange_recurrent_gated_delta_rule(
-    #         qkv=mixed_qkv_non_spec,
-    #         g=inputs["g"],
-    #         key_dim=inputs["key_dim"],
-    #         value_dim=inputs["value_dim"],
-    #         head_k_dim=inputs["head_k_dim"],
-    #         head_v_dim=inputs["head_v_dim"],
-    #         beta=inputs["beta"],
-    #         initial_state=inputs["initial_state"],
-    #         inplace_final_state=inputs["inplace_final_state"],
-    #         cu_seqlens=inputs["cu_seqlens"],
-    #         ssm_state_indices=inputs["ssm_state_indices"],
-    #         use_qk_l2norm_in_kernel=inputs["use_qk_l2norm_in_kernel"],
-    #     )
-    # )
+    mixed_qkv_non_spec = causal_conv1d_update(
+        inputs["qkv"],
+        inputs["conv_state"],
+        inputs["weight"],
+        inputs["bias"],
+        inputs["activation"],
+        conv_state_indices=inputs["conv_state_indices"],
+        validate_data=inputs["validate_data"],
+    )
+    out1, out2 = (
+        fused_rearrange_recurrent_gated_delta_rule(
+            qkv=mixed_qkv_non_spec,
+            g=inputs["g"],
+            key_dim=inputs["key_dim"],
+            value_dim=inputs["value_dim"],
+            head_k_dim=inputs["head_k_dim"],
+            head_v_dim=inputs["head_v_dim"],
+            beta=inputs["beta"],
+            initial_state=inputs["initial_state"],
+            inplace_final_state=inputs["inplace_final_state"],
+            cu_seqlens=inputs["cu_seqlens"],
+            ssm_state_indices=inputs["ssm_state_indices"],
+            use_qk_l2norm_in_kernel=inputs["use_qk_l2norm_in_kernel"],
+        )
+    )
 
     ## fused kernel
-    out1, out2 = (
+    inputs = torch.load(ipath)
+    out1_fused, out2_fused = (
         fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule(
             ## for conv1d
             qkv=inputs["qkv"],
@@ -96,16 +95,17 @@ def test(ipath, opath):
         )
     )
 
+    outputs = torch.load(opath)
     out1_ref = outputs["core_attn_out"]
     out2_ref = outputs["last_recurrent_state"]
 
-    compare_accuracy(out1, out1_ref)
-    compare_accuracy(out2, out2_ref)
+    compare_accuracy(out1, out1_fused)
+    compare_accuracy(out2, out2_fused)
 
 def main():
 
-    ipath = "/app/projects/vllm/tmp/debug/3/input_1.pt"
-    opath = "/app/projects/vllm/tmp/debug/3/output_1.pt"
+    ipath = "/app/projects/vllm/tmp/debug/1/input_1.pt"
+    opath = "/app/projects/vllm/tmp/debug/1/output_1.pt"
     
     test(ipath, opath)
 
