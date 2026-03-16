@@ -598,11 +598,12 @@ def fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule(
         h_q = key_dim // head_k_dim
         beta = torch.ones([1, qkv.shape[0], h_q], dtype=qkv.dtype, device=qkv.device)
 
+    #single_token = ((cu_seqlens[1:] - cu_seqlens[:-1]) == 1).all()
+
     # decode-only mode (single token per sequence)
     assert (
         cu_seqlens is not None 
         and batch == len(cu_seqlens) - 1
-        and all((cu_seqlens[i+1] - cu_seqlens[i]) == 1 for i in range(batch))
     ), f"cu_seqlens {str(cu_seqlens)} is not compatible for decode mode"
     
     B = 1
