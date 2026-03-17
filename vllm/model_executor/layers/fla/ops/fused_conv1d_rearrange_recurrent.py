@@ -17,7 +17,6 @@ from .op import exp
 
 @triton.jit()
 def _causal_conv1d_update_inner_kernel(
-    # Pointers to matrices
     loaded_x,  # (x_dim,) batch_size and seqlen are both 1, loaded
     w_ptr,  # (dim, width)
     bias_ptr, # (dim,)
@@ -30,46 +29,22 @@ def _causal_conv1d_update_inner_kernel(
     idx_seq,
     idx_feats, # (x_dim,)
     mask_feats, # (x_dim,)
-    # o_ptr,  # (x_dim,), to be returned
-    # Matrix dimensions
-    # batch: int, = 1
-    # dim: tl.constexpr,
-    # seqlen: tl.constexpr, = 1
     state_len: tl.constexpr,
     num_cache_lines: tl.constexpr,  # added to support vLLM larger cache lines
-    # Strides
-    # stride_x_seq: tl.constexpr,
-    # stride_x_dim: tl.constexpr,
-    # stride_x_token: tl.constexpr,
     stride_w_dim: tl.constexpr,
     stride_w_width: tl.constexpr,
     stride_conv_state_seq: tl.constexpr,
     stride_conv_state_dim: tl.constexpr,
     stride_conv_state_tok: tl.constexpr,
     stride_state_indices: tl.constexpr,
-    # stride_o_seq: tl.constexpr,
-    # stride_o_dim: tl.constexpr,
-    # stride_o_token: tl.constexpr,
-    # others
     pad_slot_id: tl.constexpr,
-    # Meta-parameters
     HAS_BIAS: tl.constexpr,
     KERNEL_WIDTH: tl.constexpr,
     SILU_ACTIVATION: tl.constexpr,
-    # IS_VARLEN: tl.constexpr, False
-    # IS_APC_ENABLED: tl.constexpr, False
-    # IS_SPEC_DECODING: tl.constexpr, False
     NP2_STATELEN: tl.constexpr,
     USE_PAD_SLOT: tl.constexpr,
-    # BLOCK_N: tl.constexpr,
 ):
     # ruff: noqa: E501
-    #idx_seq = tl.program_id(0)
-    #if idx_seq >= batch:
-    #    return
-
-    # [BLOCK_N,] elements along the feature-dimension (channel)
-    # idx_feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
     seqlen = 1
 
     # IS_APC_ENABLED is False
@@ -85,15 +60,6 @@ def _causal_conv1d_update_inner_kernel(
         acc = loaded_x.to(tl.float32)
 
     else:
-        # IS_VARLEN is False
-        #query_start_index = idx_seq * seqlen
-        #query_end_index = query_start_index + seqlen
-        #x_offset = idx_seq * stride_x_seq
-        #o_offset = idx_seq * stride_o_seq
-
-        #if query_start_index == query_end_index:
-        #    return
-
         original_x_dtype = loaded_x.dtype
         loaded_x = loaded_x.to(conv_state_ptr.type.element_ty)
 
@@ -139,19 +105,6 @@ def _causal_conv1d_update_inner_kernel(
         )
         conv_state = tl.load(conv_state_ptrs_source, mask, other=0.0)
 
-        #VAL = state_len - seqlen
-        #x_base = x_ptr + x_offset + (idx_feats * stride_x_dim)  # [BLOCK_N]
-
-        #x_ptrs = (
-        #    x_base[None, :] + ((idx_tokens - VAL) * stride_x_token)[:, None]
-        #)  # [BLOCK_M, BLOCK_N]
-
-        #mask_x = (
-        #    (idx_tokens - VAL >= 0)[:, None]
-        #    & (idx_tokens - VAL < seqlen)[:, None]
-        #    & (idx_feats < dim)[None, :]
-        #)  # token-index  # token-index  # feature-index
-        #loaded_x = tl.load(x_ptrs, mask_x, 0.0)
         tl.debug_barrier()
 
         new_conv_state = tl.where(mask, conv_state, loaded_x[None, :])
@@ -175,7 +128,6 @@ def _causal_conv1d_update_inner_kernel(
 
         # STEP 4:
         # PRE-LOAD WEIGHTS
-        # first kernel column, configured for weights to handle BLOCK_N features in range
 
         w_cols_ptrs = w_ptr + (idx_feats * stride_w_dim)[:, None] + (idx_cols * stride_w_width)[None, :]
         mask_w_cols = mask_feats[:, None] & (idx_cols < KERNEL_WIDTH - 1)[None, :]
@@ -210,12 +162,10 @@ def _causal_conv1d_update_inner_kernel(
 @triton.jit(do_not_specialize=["N", "T"])
 def fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule_kernel(
     qkv,
-    ## for conv1d
     weight,  # (dim, width)
     bias,
     conv_state,
     conv_state_indices,
-    ## delta rule
     g,
     beta,
     o,
@@ -227,7 +177,6 @@ def fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule_kernel(
     scale,
     N: tl.int64,  # num of sequences
     T: tl.int64,  # num of tokens
-    # for conv1d
     state_len: tl.constexpr,
     num_cache_lines: tl.constexpr,  # added to support vLLM larger cache lines
     stride_w_dim: tl.constexpr,
@@ -237,7 +186,6 @@ def fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule_kernel(
     stride_conv_state_tok: tl.constexpr,
     stride_state_indices: tl.constexpr,
     pad_slot_id: tl.constexpr,
-    ## delta rule
     B: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
@@ -259,7 +207,6 @@ def fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule_kernel(
     IS_CONTINUOUS_BATCHING: tl.constexpr,
     IS_SPEC_DECODING: tl.constexpr,
     IS_KDA: tl.constexpr,
-    # for conv1d Meta-parameters
     HAS_BIAS: tl.constexpr,
     KERNEL_WIDTH: tl.constexpr,
     SILU_ACTIVATION: tl.constexpr,
@@ -291,9 +238,6 @@ def fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule_kernel(
     p_k = qkv + bos * stride_qkv_l + (H * K + (i_h * K) + o_k) * stride_qkv_hd
     p_v = qkv + bos * stride_qkv_l + (2 * H * K + (i_hv * V) + o_v) * stride_qkv_hd
 
-    #p_q = q + (bos * H + i_h) * K + o_k
-    #p_k = k + (bos * H + i_h) * K + o_k
-    #p_v = v + (bos * HV + i_hv) * V + o_v
     if IS_BETA_HEADWISE:
         p_beta = beta + (bos * HV + i_hv) * V + o_v
     else:
@@ -470,10 +414,7 @@ def fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule_kernel(
         p_k += stride_qkv_l
         p_v += stride_qkv_l
 
-        #p_q += H * K
-        #p_k += H * K
         p_o += HV * V
-        #p_v += HV * V
         if not IS_KDA:
             p_g += HV
         else:
@@ -483,11 +424,9 @@ def fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule_kernel(
 
 
 def fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule(
-    ## for conv1d
     qkv: torch.Tensor,
     conv_state: torch.Tensor,
     weight: torch.Tensor,
-    ## for gated delta rule
     g: torch.Tensor,
     key_dim: int,
     value_dim: int,
@@ -501,7 +440,6 @@ def fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule(
     ssm_state_indices: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
-    ## for conv1d (with default values)
     bias: torch.Tensor | None = None,
     activation: bool | str | None = None,
     conv_state_indices: torch.Tensor | None = None,
@@ -518,7 +456,7 @@ def fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule(
     2. rearrange + gated delta rule: recurrent attention computation
     
     This fusion reduces memory traffic by avoiding intermediate tensor materialization.
-    Uses a single Triton kernel for decode-only path, falls back to sequential for prefill.
+    Uses a single Triton kernel for decode-only path.
     
     Args:
         qkv (torch.Tensor):
@@ -526,27 +464,51 @@ def fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule(
             queries of shape `[L, H_qk*D_qk]`.
             keys of shape    `[L, H_qk*D_qk]`.
             values of shape  `[L, H_v*D_v]`.
-        conv_state: Convolution state cache
-        weight: Conv1d weight
-        bias: Conv1d bias
-        activation: Activation function for conv1d ('silu', 'swish', or None)
-        conv_state_indices: Indices for batch gathering in conv_state
-        validate_data: Whether to validate inputs
-        g: Gating/decay tensor
+        conv_state: (..., dim, state_len), where state_len >= width - 1, for conv1d
+        weight: (dim, width), for conv1d
+        bias: (dim,), for conv1d
+        conv_state_indices: (batch,), dtype int32, for conv1d
+            If not None, the conv_state is a larger tensor along the batch dim,
+            and we are selecting the batch coords specified by conv_state_indices.
+            Useful for a continuous batching scenario.
+        initial_state_idx: (batch,), dtype int32, for conv1d
+            The pointer into conv_state_indices, where the cache block containing the initial state is located.
+        pad_slot_id: int, for conv1d
+                if conv_state_indices is passed, lets the kernel identify padded
+                entries that will not be processed,
+                for example: conv_state_indices = [pad_slot_id, 1 ,20 ,pad_slot_id]
+                in this case, the kernel will not process entries at
+                indices 0 and 3
+        g (torch.Tensor):
+            g (decays) of shape `[B, T, HV]`.
         key_dim, value_dim: Dimensions for key and value
         head_k_dim, head_v_dim: Per-head dimensions
-        beta: Beta scaling tensor
-        scale: Attention scale factor
-        initial_state: Initial SSM state
-        inplace_final_state: Whether to update state in-place
-        cu_seqlens: Cumulative sequence lengths
-        ssm_state_indices: SSM state indices
-        num_accepted_tokens: Number of accepted tokens (for speculative decoding)
+        beta (torch.Tensor):
+            betas of shape `[B, T, HV]`.
+        scale (Optional[int]):
+            Scale factor for the RetNet attention scores.
+            If not provided, it will default to `1 / sqrt(K)`. Default: `None`.
+        initial_state (Optional[torch.Tensor]):
+            Initial state of shape `[N, HV, V, K]` for `N` input sequences.
+            For equal-length input sequences, `N` equals the batch size `B`.
+            Default: `None`.
+        inplace_final_state: bool:
+            Whether to store the final state in-place to save memory.
+            Default: `True`.
+        cu_seqlens (torch.LongTensor):
+            Cumulative sequence lengths of shape `[N+1]` used for variable-length training,
+            consistent with the FlashAttention API.
+        ssm_state_indices (Optional[torch.Tensor]):
+            Indices to map the input sequences to the initial/final states.
+        num_accepted_tokens (Optional[torch.Tensor]):
+            Number of accepted tokens for each sequence during decoding.
         use_qk_l2norm_in_kernel: Whether to apply L2 normalization to q, k
         
     Returns:
-        output: Attention output
-        final_state: Updated SSM state
+        o (torch.Tensor):
+            Outputs of shape `[B, T, HV, V]`.
+        final_state (torch.Tensor):
+            Final state of shape `[N, HV, V, K]`.
     """
     ## for conv1d
     if validate_data:
@@ -591,14 +553,11 @@ def fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule(
     assert qkv.shape == expected_shape, f"expect qkv to be in shape {expected_shape}, got {qkv.shape}"
     if scale is None:
         scale = head_k_dim ** -0.5
-        #scale = k.shape[-1] ** -0.5
     else:
         assert scale > 0, "scale must be positive"
     if beta is None:
         h_q = key_dim // head_k_dim
         beta = torch.ones([1, qkv.shape[0], h_q], dtype=qkv.dtype, device=qkv.device)
-
-    #single_token = ((cu_seqlens[1:] - cu_seqlens[:-1]) == 1).all()
 
     # decode-only mode (single token per sequence)
     assert (
@@ -612,8 +571,6 @@ def fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule(
     HV = value_dim // head_v_dim
     K = head_k_dim
     V = head_v_dim
-    #B, T, H, K, V = *k.shape, v.shape[-1]
-    #HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
     BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
@@ -621,7 +578,6 @@ def fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule(
     num_stages = 3
     num_warps = 1
 
-    #o = q.new_empty(NK, *v.shape)
     o = qkv.new_empty(NK, B, T, HV, V)
     if inplace_final_state:
         final_state = initial_state

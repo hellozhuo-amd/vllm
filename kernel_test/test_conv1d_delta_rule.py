@@ -12,6 +12,9 @@ from vllm.model_executor.layers.fla.ops import (
     fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule,
 )
 
+#from aiter.ops.triton.fusions.fused_rearrange_recurrent import fused_rearrange_recurrent_gated_delta_rule
+#from aiter.ops.triton.fusions.fused_conv1d_rearrange_recurrent import fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule
+
 def compare_accuracy(current, reference):
     """Print quick statistics comparing FP8 and SageAttn tensors."""
     current_f = current.float()
@@ -111,7 +114,7 @@ def test(ipath, opath):
     compare_accuracy(out3, out3_fused)
     compare_accuracy(out4, out4_fused)
 
-def get_func(ipath, fuse=False):
+def get_func(ipath, fuse=False, part=0):
 
     inputs = torch.load(ipath)
     if fuse:
@@ -142,7 +145,47 @@ def get_func(ipath, fuse=False):
             )
             return out1_fused, out2_fused
     else:
-        def fn():
+        if part == 0:
+            def fn():
+                mixed_qkv_non_spec = causal_conv1d_update(
+                    inputs["qkv"],
+                    inputs["conv_state"],
+                    inputs["weight"],
+                    inputs["bias"],
+                    inputs["activation"],
+                    conv_state_indices=inputs["conv_state_indices"],
+                    validate_data=inputs["validate_data"],
+                )
+                out1, out2 = (
+                    fused_rearrange_recurrent_gated_delta_rule(
+                        qkv=mixed_qkv_non_spec,
+                        g=inputs["g"],
+                        key_dim=inputs["key_dim"],
+                        value_dim=inputs["value_dim"],
+                        head_k_dim=inputs["head_k_dim"],
+                        head_v_dim=inputs["head_v_dim"],
+                        beta=inputs["beta"],
+                        initial_state=inputs["initial_state"],
+                        inplace_final_state=inputs["inplace_final_state"],
+                        cu_seqlens=inputs["cu_seqlens"],
+                        ssm_state_indices=inputs["ssm_state_indices"],
+                        use_qk_l2norm_in_kernel=inputs["use_qk_l2norm_in_kernel"],
+                    )
+                )
+                return out1, out2
+        elif part == 1:
+            def fn():
+                mixed_qkv_non_spec = causal_conv1d_update(
+                    inputs["qkv"],
+                    inputs["conv_state"],
+                    inputs["weight"],
+                    inputs["bias"],
+                    inputs["activation"],
+                    conv_state_indices=inputs["conv_state_indices"],
+                    validate_data=inputs["validate_data"],
+                )
+                return mixed_qkv_non_spec
+        else:
             mixed_qkv_non_spec = causal_conv1d_update(
                 inputs["qkv"],
                 inputs["conv_state"],
@@ -152,36 +195,43 @@ def get_func(ipath, fuse=False):
                 conv_state_indices=inputs["conv_state_indices"],
                 validate_data=inputs["validate_data"],
             )
-            out1, out2 = (
-                fused_rearrange_recurrent_gated_delta_rule(
-                    qkv=mixed_qkv_non_spec,
-                    g=inputs["g"],
-                    key_dim=inputs["key_dim"],
-                    value_dim=inputs["value_dim"],
-                    head_k_dim=inputs["head_k_dim"],
-                    head_v_dim=inputs["head_v_dim"],
-                    beta=inputs["beta"],
-                    initial_state=inputs["initial_state"],
-                    inplace_final_state=inputs["inplace_final_state"],
-                    cu_seqlens=inputs["cu_seqlens"],
-                    ssm_state_indices=inputs["ssm_state_indices"],
-                    use_qk_l2norm_in_kernel=inputs["use_qk_l2norm_in_kernel"],
+            def fn():
+                out1, out2 = (
+                    fused_rearrange_recurrent_gated_delta_rule(
+                        qkv=mixed_qkv_non_spec,
+                        g=inputs["g"],
+                        key_dim=inputs["key_dim"],
+                        value_dim=inputs["value_dim"],
+                        head_k_dim=inputs["head_k_dim"],
+                        head_v_dim=inputs["head_v_dim"],
+                        beta=inputs["beta"],
+                        initial_state=inputs["initial_state"],
+                        inplace_final_state=inputs["inplace_final_state"],
+                        cu_seqlens=inputs["cu_seqlens"],
+                        ssm_state_indices=inputs["ssm_state_indices"],
+                        use_qk_l2norm_in_kernel=inputs["use_qk_l2norm_in_kernel"],
+                    )
                 )
-            )
-            return out1, out2
+                return out1, out2
 
     return fn
 
 
 def bench(ipath):
 
-    fn = get_func(ipath, fuse=False)
     fn_fused = get_func(ipath, fuse=True)
+    fn = get_func(ipath, fuse=False)
+    fn_k1 = get_func(ipath, fuse=False, part=1)
+    fn_k2 = get_func(ipath, fuse=False, part=2)
 
     ms_fused = triton.testing.do_bench(fn_fused)
     ms = triton.testing.do_bench(fn)
+    ms_k1 = triton.testing.do_bench(fn_k1)
+    ms_k2 = triton.testing.do_bench(fn_k2)
 
     print(f"before fuse: {ms:.6f} ms")
+    print(f"before fuse k1: {ms_k1:.6f} ms")
+    print(f"before fuse k2: {ms_k2:.6f} ms")
     print(f"after fuse: {ms_fused:.6f} ms")
 
 def main():
