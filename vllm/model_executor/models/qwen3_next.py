@@ -591,7 +591,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         query, key, value = map(
             lambda x: rearrange(x, "l p d -> l (p d)"), (query, key, value)
         )
-        #mixed_qkv = torch.cat((query, key, value), dim=-1)
+        mixed_qkv = torch.cat((query, key, value), dim=-1)
 
         # ============================================================
         # Part 2: Core Attention (Custom Op)
@@ -605,9 +605,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         )
 
         torch.ops.vllm.gdn_attention_core(
-            query,
-            key,
-            value,
+            mixed_qkv,
             b,
             a,
             core_attn_out,
@@ -628,9 +626,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
     def _forward_core(
         self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
+        mixed_qkv: torch.Tensor,
         b: torch.Tensor,
         a: torch.Tensor,
         core_attn_out: torch.Tensor,
@@ -662,6 +658,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_accepted_tokens = attn_metadata.num_accepted_tokens
 
+        mixed_qkv = mixed_qkv[:num_actual_tokens]
         b = b[:num_actual_tokens]
         a = a[:num_actual_tokens]
 
@@ -671,8 +668,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         )
 
         if spec_sequence_masks is not None:
-            mixed_qkv = torch.cat((q, k, v), dim=-1)
-            mixed_qkv = mixed_qkv[:num_actual_tokens]
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
                 mixed_qkv_spec = mixed_qkv
                 mixed_qkv_non_spec = None
@@ -680,8 +675,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 mixed_qkv_spec = mixed_qkv.index_select(0, spec_token_indx)
                 mixed_qkv_non_spec = mixed_qkv.index_select(0, non_spec_token_indx)
         elif attn_metadata.num_prefills > 0:
-            mixed_qkv = torch.cat((q, k, v), dim=-1)
-            mixed_qkv = mixed_qkv[:num_actual_tokens]
             mixed_qkv_spec = None
             mixed_qkv_non_spec = mixed_qkv
         else:
@@ -840,8 +833,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 expected function:
                 fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule
                 """
-                mixed_qkv = torch.cat((q, k, v), dim=-1)
-                mixed_qkv_non_spec = mixed_qkv[:num_actual_tokens]
+                mixed_qkv_non_spec = mixed_qkv
                 #mixed_qkv_non_spec = causal_conv1d_update(
                 #    mixed_qkv_non_spec,
                 #    conv_state,
@@ -1538,9 +1530,7 @@ class Qwen3NextForCausalLM(
 
 
 def gdn_attention_core(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
+    mixed_qkv: torch.Tensor,
     b: torch.Tensor,
     a: torch.Tensor,
     core_attn_out: torch.Tensor,
@@ -1554,9 +1544,7 @@ def gdn_attention_core(
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
     self._forward_core(
-        q=query,
-        k=key,
-        v=value,
+        mixed_qkv=mixed_qkv,
         b=b,
         a=a,
         core_attn_out=core_attn_out,
@@ -1564,9 +1552,7 @@ def gdn_attention_core(
 
 
 def gdn_attention_core_fake(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
+    mixed_qkv: torch.Tensor,
     b: torch.Tensor,
     a: torch.Tensor,
     core_attn_out: torch.Tensor,
