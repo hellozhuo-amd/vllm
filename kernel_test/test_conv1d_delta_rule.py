@@ -1,5 +1,6 @@
 import os
 import torch
+import triton
 
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
@@ -68,6 +69,9 @@ def test(ipath, opath):
         )
     )
 
+    out3 = inputs["conv_state"]
+    out4 = inputs["initial_state"]
+
     ## fused kernel
     inputs = torch.load(ipath)
     out1_fused, out2_fused = (
@@ -95,19 +99,98 @@ def test(ipath, opath):
         )
     )
 
+    out3_fused = inputs["conv_state"]
+    out4_fused = inputs["initial_state"]
+
     outputs = torch.load(opath)
     out1_ref = outputs["core_attn_out"]
     out2_ref = outputs["last_recurrent_state"]
 
     compare_accuracy(out1, out1_fused)
     compare_accuracy(out2, out2_fused)
+    compare_accuracy(out3, out3_fused)
+    compare_accuracy(out4, out4_fused)
+
+def get_func(ipath, fuse=False):
+
+    inputs = torch.load(ipath)
+    if fuse:
+        def fn():
+            out1_fused, out2_fused = (
+                fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule(
+                    ## for conv1d
+                    qkv=inputs["qkv"],
+                    conv_state=inputs["conv_state"],
+                    weight=inputs["weight"],
+                    bias=inputs["bias"],
+                    activation=inputs["activation"],
+                    conv_state_indices=inputs["conv_state_indices"],
+                    validate_data=inputs["validate_data"],
+                    ## now for rearrange and gated delta rule
+                    g=inputs["g"],
+                    key_dim=inputs["key_dim"],
+                    value_dim=inputs["value_dim"],
+                    head_k_dim=inputs["head_k_dim"],
+                    head_v_dim=inputs["head_v_dim"],
+                    beta=inputs["beta"],
+                    initial_state=inputs["initial_state"],
+                    inplace_final_state=inputs["inplace_final_state"],
+                    cu_seqlens=inputs["cu_seqlens"],
+                    ssm_state_indices=inputs["ssm_state_indices"],
+                    use_qk_l2norm_in_kernel=inputs["use_qk_l2norm_in_kernel"],
+                )
+            )
+            return out1_fused, out2_fused
+    else:
+        def fn():
+            mixed_qkv_non_spec = causal_conv1d_update(
+                inputs["qkv"],
+                inputs["conv_state"],
+                inputs["weight"],
+                inputs["bias"],
+                inputs["activation"],
+                conv_state_indices=inputs["conv_state_indices"],
+                validate_data=inputs["validate_data"],
+            )
+            out1, out2 = (
+                fused_rearrange_recurrent_gated_delta_rule(
+                    qkv=mixed_qkv_non_spec,
+                    g=inputs["g"],
+                    key_dim=inputs["key_dim"],
+                    value_dim=inputs["value_dim"],
+                    head_k_dim=inputs["head_k_dim"],
+                    head_v_dim=inputs["head_v_dim"],
+                    beta=inputs["beta"],
+                    initial_state=inputs["initial_state"],
+                    inplace_final_state=inputs["inplace_final_state"],
+                    cu_seqlens=inputs["cu_seqlens"],
+                    ssm_state_indices=inputs["ssm_state_indices"],
+                    use_qk_l2norm_in_kernel=inputs["use_qk_l2norm_in_kernel"],
+                )
+            )
+            return out1, out2
+
+    return fn
+
+
+def bench(ipath):
+
+    fn = get_func(ipath, fuse=False)
+    fn_fused = get_func(ipath, fuse=True)
+
+    ms_fused = triton.testing.do_bench(fn_fused)
+    ms = triton.testing.do_bench(fn)
+
+    print(f"before fuse: {ms:.6f} ms")
+    print(f"after fuse: {ms_fused:.6f} ms")
 
 def main():
 
-    ipath = "/app/projects/vllm/tmp/debug/1/input_1.pt"
-    opath = "/app/projects/vllm/tmp/debug/1/output_1.pt"
+    ipath = "/app/projects/vllm/tmp/debug/2/input_1.pt"
+    opath = "/app/projects/vllm/tmp/debug/2/output_1.pt"
     
-    test(ipath, opath)
+    #test(ipath, opath)
+    bench(ipath)
 
 if __name__ == "__main__":
     main()
