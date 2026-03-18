@@ -98,6 +98,7 @@ from .utils import (
     maybe_prefix,
 )
 
+### import the fused kernel from vllm, because aiter may bring some hip error for other existing aiter-based kernels in vllm
 #from aiter.ops.triton.fusions.fused_rearrange_recurrent import fused_rearrange_recurrent_gated_delta_rule
 #from aiter.ops.triton.fusions.fused_conv1d_rearrange_recurrent import fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule
 from vllm.model_executor.layers.fla.ops import (
