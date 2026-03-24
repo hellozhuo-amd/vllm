@@ -1,5 +1,7 @@
 #!/bin/bash
 # Script to clear all caches and ensure clean restart of vLLM server
+#
+INSTALL_PATH=$1
 
 set -e
 
@@ -12,7 +14,7 @@ sleep 2
 
 # 2. Clear Python bytecode cache
 echo "[2/6] Clearing Python __pycache__ directories..."
-cd /app/projects/vllm
+cd $INSTALL_PATH
 find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 find . -type f -name "*.pyc" -delete 2>/dev/null || true
 find . -type f -name "*.pyo" -delete 2>/dev/null || true
@@ -30,4 +32,4 @@ rm -rf ${XDG_CACHE_HOME:-$HOME/.cache}/triton/* 2>/dev/null || true
 echo "[4/6] Clearing CUDA kernel cache..."
 rm -rf ~/.nv/* 2>/dev/null || true
 
-tmp/start_vllm.sh
+trace/start_vllm.sh
