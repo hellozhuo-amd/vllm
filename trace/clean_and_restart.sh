@@ -32,4 +32,4 @@ rm -rf ${XDG_CACHE_HOME:-$HOME/.cache}/triton/* 2>/dev/null || true
 echo "[4/6] Clearing CUDA kernel cache..."
 rm -rf ~/.nv/* 2>/dev/null || true
 
-trace/start_vllm.sh
+bash trace/start_vllm.sh
