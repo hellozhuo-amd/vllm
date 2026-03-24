@@ -1,9 +1,9 @@
 ## send requests with custom data
-NAME="fusion_results4.json"
+NAME="fusion_results.json"
 vllm bench serve \
   --backend vllm \
   --dataset_name custom \
-  --dataset_path tmp/my_prompts.jsonl \
+  --dataset_path trace/my_prompts.jsonl \
   --model Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
   --ready_check_timeout_sec 7200 \
   --percentile_metrics ttft,tpot,itl,e2el \
@@ -14,7 +14,7 @@ vllm bench serve \
   --temperature 0 \
   --save-result \
   --save-detailed \
-  --result_dir tmp/responses \
+  --result_dir /tmp/profile \
   --result_filename $NAME
 
-python tmp/extract_responses.py tmp/responses/$NAME
+python trace/extract_responses.py /tmp/profile/$NAME
