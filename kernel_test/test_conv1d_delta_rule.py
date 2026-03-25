@@ -230,12 +230,12 @@ def bench(ipath):
 
     ms_fused = triton.testing.do_bench(fn_fused)
     ms = triton.testing.do_bench(fn)
-    #ms_k1 = triton.testing.do_bench(fn_k1)
-    #ms_k2 = triton.testing.do_bench(fn_k2)
+    ms_k1 = triton.testing.do_bench(fn_k1)
+    ms_k2 = triton.testing.do_bench(fn_k2)
 
     print(f"before fuse: {ms:.6f} ms")
-    #print(f"before fuse k1: {ms_k1:.6f} ms")
-    #print(f"before fuse k2: {ms_k2:.6f} ms")
+    print(f"before fuse k1: {ms_k1:.6f} ms")
+    print(f"before fuse k2: {ms_k2:.6f} ms")
     print(f"after fuse: {ms_fused:.6f} ms")
 
 def main():
@@ -243,8 +243,8 @@ def main():
     ipath = "/app/projects/vllm/tmp/debug/4/input_1.pt"
     opath = "/app/projects/vllm/tmp/debug/4/output_1.pt"
     
-    test(ipath, opath)
-    #bench(ipath)
+    #test(ipath, opath)
+    bench(ipath)
 
 if __name__ == "__main__":
     main()
