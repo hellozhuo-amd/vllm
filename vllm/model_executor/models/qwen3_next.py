@@ -100,7 +100,7 @@ from .utils import (
 #from aiter.ops.triton.fusions.fused_rearrange_recurrent import fused_rearrange_recurrent_gated_delta_rule
 #from aiter.ops.triton.fusions.fused_conv1d_rearrange_recurrent import fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule
 from vllm.model_executor.layers.fla.ops import (
-    fused_rearrange_recurrent_gated_delta_rule,
+    fused_rearrange_sigmoid_gated_delta_rule,
     fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule,
 )
 
@@ -690,37 +690,32 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             mixed_qkv_non_spec = None
 
 
-        g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
-
-        if spec_sequence_masks is not None:
-            if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
-                g_spec = g
-                beta_spec = beta
-                g_non_spec = None
-                beta_non_spec = None
-            else:
-                g_spec = g.index_select(1, spec_token_indx)
-                beta_spec = beta.index_select(1, spec_token_indx)
+        if attn_metadata.num_prefills > 0:
+            g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+            if spec_sequence_masks is not None:
                 g_non_spec = g.index_select(1, non_spec_token_indx)
                 beta_non_spec = beta.index_select(1, non_spec_token_indx)
+            else:
+                g_non_spec = g
+                beta_non_spec = beta
         else:
-            g_spec = None
-            beta_spec = None
-            g_non_spec = g
-            beta_non_spec = beta
+            g_non_spec = None
+            beta_non_spec = None
 
         # 2. Recurrent attention
 
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
-            core_attn_out_spec, last_recurrent_state = fused_rearrange_recurrent_gated_delta_rule(
+            core_attn_out_spec, last_recurrent_state = fused_rearrange_sigmoid_gated_delta_rule(
+                A_log=self.A_log,
+                a=a,
+                b=b,
+                dt_bias=self.dt_bias,
                 qkv=mixed_qkv_spec,
-                g=g_spec,
                 key_dim=self.key_dim // self.tp_size,
                 value_dim=self.value_dim // self.tp_size,
                 head_k_dim=self.head_k_dim,
                 head_v_dim=self.head_v_dim,
-                beta=beta_spec,
                 initial_state=ssm_state,
                 inplace_final_state=True,
                 cu_seqlens=spec_query_start_loc[: attn_metadata.num_spec_decodes + 1],
@@ -761,14 +756,16 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         elif attn_metadata.num_decodes > 0:
             if mixed_qkv_non_spec is not None:
                 core_attn_out_non_spec, last_recurrent_state = (
-                    fused_rearrange_recurrent_gated_delta_rule(
+                    fused_rearrange_sigmoid_gated_delta_rule(
+                        A_log=self.A_log,
+                        a=a,
+                        b=b,
+                        dt_bias=self.dt_bias,
                         qkv=mixed_qkv_non_spec,
-                        g=g_non_spec,
                         key_dim=self.key_dim // self.tp_size,
                         value_dim=self.value_dim // self.tp_size,
                         head_k_dim=self.head_k_dim,
                         head_v_dim=self.head_v_dim,
-                        beta=beta_non_spec,
                         initial_state=ssm_state,
                         inplace_final_state=True,
                         cu_seqlens=non_spec_query_start_loc[
@@ -802,14 +799,16 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                     validate_data=True,
                 )
                 core_attn_out_non_spec, last_recurrent_state = (
-                    fused_rearrange_recurrent_gated_delta_rule(
+                    fused_rearrange_sigmoid_gated_delta_rule(
+                        A_log=self.A_log,
+                        a=a,
+                        b=b,
+                        dt_bias=self.dt_bias,
                         qkv=mixed_qkv_non_spec,
-                        g=g_non_spec,
                         key_dim=self.key_dim // self.tp_size,
                         value_dim=self.value_dim // self.tp_size,
                         head_k_dim=self.head_k_dim,
                         head_v_dim=self.head_v_dim,
-                        beta=beta_non_spec,
                         initial_state=ssm_state,
                         inplace_final_state=True,
                         cu_seqlens=non_spec_query_start_loc[
