@@ -10,6 +10,7 @@ from einops import rearrange
 from torch import nn
 from transformers.activations import ACT2FN
 
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (
     CacheConfig,
@@ -155,7 +156,17 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.shared_expert_gate",
         )
 
-        if config.shared_expert_intermediate_size > 0:
+        self.is_fusion_moe_shared_experts_enabled = (
+            rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+        )
+        self.n_shared_experts = 1
+
+        if (
+            self.is_fusion_moe_shared_experts_enabled
+            or config.shared_expert_intermediate_size <= 0
+        ):
+            self.shared_expert = None
+        else:
             self.shared_expert = Qwen3NextMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.shared_expert_intermediate_size,
@@ -165,8 +176,6 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 expert_gate=self.shared_expert_gate,
                 prefix=f"{prefix}.shared_expert",
             )
-        else:
-            self.shared_expert = None
 
         self.experts = SharedFusedMoE(
             shared_experts=self.shared_expert,
@@ -175,14 +184,19 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
-            reduce_results=False,
+            reduce_results=self.is_fusion_moe_shared_experts_enabled,
             renormalize=config.norm_topk_prob,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
             is_sequence_parallel=self.is_sequence_parallel,
+            n_shared_experts=self.n_shared_experts
+            if self.is_fusion_moe_shared_experts_enabled
+            else None,
         )
+        if self.is_fusion_moe_shared_experts_enabled:
+            self.experts._shared_expert_gate = self.shared_expert_gate
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
@@ -205,6 +219,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 hidden_states=hidden_states, router_logits=router_logits
             )
 
+        if self.is_fusion_moe_shared_experts_enabled:
+            _, final_hidden_states = final_hidden_states
+
         if self.shared_expert is not None:
             final_hidden_states = final_hidden_states[0] + final_hidden_states[1]
 
@@ -218,7 +235,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 final_hidden_states
             )
 
-        return final_hidden_states.view(orig_shape)
+        return final_hidden_states.view(num_tokens, hidden_dim)
 
 
 class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
@@ -367,16 +384,24 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
-    def fix_query_key_value_ordering(
+
+    @torch.compile(fullgraph=True)
+    def prepare_gdn_attention_core_inputs(
         self,
         mixed_qkvz,
         mixed_ba,
+        num_tokens,
     ):
         """
-        Derives `query`, `key` and `value` tensors from `mixed_qkvzba`.
+        Derives mixed_qkv, z, b, a, and initializes core_attn_out in a
+        single fused kernel launch to minimize launch overhead.
         """
-        new_tensor_shape_qkvz = mixed_qkvz.size()[:-1] + (
-            self.num_k_heads // self.tp_size,
+        base_shape_qkvz = mixed_qkvz.size()[:-1]
+        base_shape_ba = mixed_ba.size()[:-1]
+        ng = self.num_k_heads // self.tp_size
+
+        new_tensor_shape_qkvz = base_shape_qkvz + (
+            ng,
             (
                 self.head_k_dim
                 + self.head_k_dim
@@ -385,8 +410,8 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 // self.num_k_heads
             ),
         )
-        new_tensor_shape_ba = mixed_qkvz.size()[:-1] + (
-            self.num_k_heads // self.tp_size,
+        new_tensor_shape_ba = base_shape_ba + (
+            ng,
             2 * self.num_v_heads // self.num_k_heads,
         )
 
@@ -404,39 +429,104 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             self.num_v_heads // self.num_k_heads,
         ]
 
-        # [b, sq, ng, (hn + hn + np/ng * hn + np/ng + np/ng)]
-        # --> [b, sq, ng, hn], [b, sq, ng, hn], [b, sq, ng, np/ng * hn],
-        #  [b, sq, ng, np/ng * hn], [b, sq, ng, np/ng], [b, sq, ng, np/ng]
-        (query, key, value, z) = torch.split(mixed_qkvz, split_arg_list_qkvz, dim=2)
-        (b, a) = torch.split(mixed_ba, split_arg_list_ba, dim=2)
+        (query, key, value, z) = torch.split(mixed_qkvz, split_arg_list_qkvz, dim=-1)
+        (b, a) = torch.split(mixed_ba, split_arg_list_ba, dim=-1)
 
-        # [b, sq, ng, np/ng * hn] -> [b, sq, np, hn]
-        value = value.reshape(value.size(0), -1, self.head_v_dim)
-        z = z.reshape(z.size(0), -1, self.head_v_dim)
-        b = b.reshape(b.size(0), self.num_v_heads // self.tp_size)
-        a = a.reshape(a.size(0), self.num_v_heads // self.tp_size)
+        # 1. Interleave Q, K, V logically.
+        # Inside compile, this doesn't allocate memory yet; it just creates an indexing map.
+        mixed_qkv_logical = torch.cat([
+            query.reshape(num_tokens, -1),
+            key.reshape(num_tokens, -1),
+            value.reshape(num_tokens, -1)
+        ], dim=-1)
 
-        return query, key, value, z, b, a
+        # Note: we need zeros for the core_attn_out buffer
+        # see discussions in https://github.com/vllm-project/vllm/pull/28182
+        core_attn_zeros = torch.zeros(
+            num_tokens * (self.num_v_heads // self.tp_size) * self.head_v_dim,
+            dtype=mixed_qkvz.dtype,
+            device=mixed_qkvz.device
+        )
 
+        # We flatten everything into a 1D sequence and concatenate. Inductor will launch
+        # ONE Triton kernel to populate this single buffer.
+        fused = torch.cat([
+            mixed_qkv_logical.reshape(-1),
+            z.reshape(-1),
+            b.reshape(-1),
+            a.reshape(-1),
+            core_attn_zeros  # (Already 1D)
+        ], dim=0)
+
+        # 4. Calculate offsets dynamically to slice the buffer back out
+        curr = 0
+        qkv_numel = mixed_qkv_logical.numel()
+        z_numel = z.numel()
+        b_numel = b.numel()
+        a_numel = a.numel()
+        core_numel = core_attn_zeros.numel()
+
+        # 5. Slice and reshape (Zero-copy metadata changes)
+        mixed_qkv_out = fused[curr : curr + qkv_numel].view(num_tokens, -1)
+        curr += qkv_numel
+
+        z_out = fused[curr : curr + z_numel].view(num_tokens, -1, self.head_v_dim)
+        curr += z_numel
+
+        b_out = fused[curr : curr + b_numel].view(num_tokens, self.num_v_heads // self.tp_size)
+        curr += b_numel
+
+        a_out = fused[curr : curr + a_numel].view(num_tokens, self.num_v_heads // self.tp_size)
+        curr += a_numel
+
+        core_attn_out = fused[curr : curr + core_numel].view(
+            num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim
+        )
+
+        return mixed_qkv_out, z_out, b_out, a_out, core_attn_out
+
+
+    @torch.compile(fullgraph=True)
     def rearrange_mixed_qkv(self, mixed_qkv):
         if mixed_qkv is None:
             return None, None, None
+
+        l = mixed_qkv.shape[0]
+        q_dim = self.key_dim // self.tp_size
+        k_dim = self.key_dim // self.tp_size
+        v_dim = self.value_dim // self.tp_size
+
+        # 1. Create the non-contiguous 2D views
         query, key, value = torch.split(
             mixed_qkv,
-            [
-                self.key_dim // self.tp_size,
-                self.key_dim // self.tp_size,
-                self.value_dim // self.tp_size,
-            ],
-            dim=-1,
+            [q_dim, k_dim, v_dim],
+            dim=-1
         )
-        query, key = map(
-            lambda x: rearrange(x, "l (h d) -> 1 l h d", d=self.head_k_dim),
-            (query, key),
-        )
-        value = rearrange(value, "l (h d) -> 1 l h d", d=self.head_v_dim)
-        return query.contiguous(), key.contiguous(), value.contiguous()
 
+        # 2. Flatten and concatenate to force a single triton graph.
+        fused = torch.cat([
+            query.reshape(-1),
+            key.reshape(-1),
+            value.reshape(-1)
+        ], dim=0)
+
+        # 3. Slice the single buffer.
+        q_size = l * q_dim
+        k_size = l * k_dim
+
+        q_contig = fused[0 : q_size]
+        k_contig = fused[q_size : q_size + k_size]
+        v_contig = fused[q_size + k_size : ]
+
+        # 4. Zero cost reshape
+        query = q_contig.view(1, l, -1, self.head_k_dim)
+        key = k_contig.view(1, l, -1, self.head_k_dim)
+        value = v_contig.view(1, l, -1, self.head_v_dim)
+
+        return query, key, value
+
+
+    @torch.compile
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -455,13 +545,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         # ============================================================
         projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
         projected_states_ba, _ = self.in_proj_ba(hidden_states)
-        query, key, value, z, b, a = self.fix_query_key_value_ordering(
-            projected_states_qkvz, projected_states_ba
+        mixed_qkv, z, b, a, core_attn_out = self.prepare_gdn_attention_core_inputs(
+            projected_states_qkvz, projected_states_ba, num_tokens
         )
-        query, key, value = map(
-            lambda x: rearrange(x, "l p d -> l (p d)"), (query, key, value)
-        )
-        mixed_qkv = torch.cat((query, key, value), dim=-1)
 
         # ============================================================
         # Part 2: Core Attention (Custom Op)
@@ -1042,7 +1128,8 @@ class Qwen3NextModel(nn.Module):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+            num_experts=self.config.num_experts
+            + (1 if rocm_aiter_ops.is_fusion_moe_shared_experts_enabled() else 0),
             num_redundant_experts=self.num_redundant_experts,
         )
 
@@ -1072,11 +1159,18 @@ class Qwen3NextModel(nn.Module):
                 if name is None:
                     continue
 
+            is_fusion_moe_shared_experts_layer = (
+                rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+                and ("mlp.shared_expert" in name)
+            )
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
 
                 if "mlp.experts" in name:
+                    continue
+                if is_fusion_moe_shared_experts_layer:
                     continue
 
                 name = name.replace(weight_name, param_name)
@@ -1094,48 +1188,81 @@ class Qwen3NextModel(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                for mapping in expert_params_mapping:
-                    param_name, weight_name, expert_id, shard_id = mapping
-                    if weight_name not in name:
-                        continue
-                    name = name.replace(weight_name, param_name)
-                    # Skip layers on other devices.
-                    if is_pp_missing_parameter(name, self):
-                        continue
-                    # Skip loading extra bias for GPTQ models.
-                    if (
-                        name.endswith(".bias") or name.endswith("_bias")
-                    ) and name not in params_dict:
-                        continue
-                    if name not in params_dict:
-                        continue
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(
-                        param,
-                        loaded_weight,
-                        name,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
+                name_mapped = name
+                num_chunks = 1
+                if is_fusion_moe_shared_experts_layer:
+                    num_chunks = getattr(self.config, "n_shared_experts", 1) or 1
+                    split_dim = (
+                        1
+                        if ("down_proj.weight" in name and loaded_weight.ndim > 1)
+                        else 0
                     )
-                    break
-                else:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    if is_pp_missing_parameter(name, self):
-                        continue
-                    if name not in params_dict:
-                        logger.warning_once(
-                            f"Parameter {name} not found in params_dict, skip loading"
+                    total = loaded_weight.shape[split_dim]
+                    assert total % num_chunks == 0, (
+                        f"Shared expert weight dim {total} "
+                        f"not divisible by num_chunks {num_chunks}"
+                    )
+                    chunk_size = total // num_chunks
+
+                for j in range(num_chunks):
+                    chunk_name = name
+                    weight_to_load = loaded_weight
+
+                    if is_fusion_moe_shared_experts_layer:
+                        chunk_slice = slice(j * chunk_size, (j + 1) * chunk_size)
+                        if loaded_weight.ndim == 1:
+                            weight_to_load = loaded_weight[chunk_slice]
+                        elif split_dim == 0:
+                            weight_to_load = loaded_weight[chunk_slice, :]
+                        else:
+                            weight_to_load = loaded_weight[:, chunk_slice]
+                        chunk_name = name.replace(
+                            "mlp.shared_expert",
+                            f"mlp.experts.{self.config.num_experts + j}",
                         )
-                        continue
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+
+                    for mapping in expert_params_mapping:
+                        param_name, weight_name, expert_id, shard_id = mapping
+                        if weight_name not in chunk_name:
+                            continue
+                        mapped_name = chunk_name.replace(weight_name, param_name)
+                        if is_pp_missing_parameter(mapped_name, self):
+                            continue
+                        if (
+                            mapped_name.endswith(".bias") or mapped_name.endswith("_bias")
+                        ) and mapped_name not in params_dict:
+                            continue
+                        if mapped_name not in params_dict:
+                            continue
+                        param = params_dict[mapped_name]
+                        weight_loader = param.weight_loader
+                        weight_loader(
+                            param,
+                            weight_to_load,
+                            mapped_name,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
+                        )
+                        if is_fusion_moe_shared_experts_layer:
+                            loaded_params.add(name_mapped)
+                        break
+                    else:
+                        if name.endswith(".bias") and name not in params_dict:
+                            continue
+                        if is_pp_missing_parameter(name, self):
+                            continue
+                        if name not in params_dict:
+                            logger.warning_once(
+                                f"Parameter {name} not found in params_dict, skip loading"
+                            )
+                            continue
+                        param = params_dict[name]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
+            if name is not None and not is_fusion_moe_shared_experts_layer:
+                loaded_params.add(name)
         return loaded_params
 
 
