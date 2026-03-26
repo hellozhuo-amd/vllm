@@ -103,6 +103,9 @@ from vllm.model_executor.layers.fla.ops import (
     fused_rearrange_sigmoid_gated_delta_rule,
     fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule,
 )
+from vllm.model_executor.layers.mamba.ops.causal_conv1d_fast import (
+    causal_conv1d_update_fast,
+)
 
 logger = init_logger(__name__)
 
@@ -675,7 +678,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 metadata=attn_metadata,
             ).transpose(0, 1)
         elif mixed_qkv_non_spec is not None and attn_metadata.num_decodes > 0:
-            mixed_qkv_non_spec = causal_conv1d_update(
+            mixed_qkv_non_spec = causal_conv1d_update_fast(
                 mixed_qkv_non_spec,
                 conv_state,
                 conv_weights,
@@ -787,7 +790,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule
                 """
                 mixed_qkv_non_spec = mixed_qkv
-                mixed_qkv_non_spec = causal_conv1d_update(
+                mixed_qkv_non_spec = causal_conv1d_update_fast(
                     mixed_qkv_non_spec,
                     conv_state,
                     conv_weights,
