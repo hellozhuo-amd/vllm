@@ -11,7 +11,6 @@ from .fused_recurrent import fused_recurrent_gated_delta_rule
 from .fused_sigmoid_gating import fused_sigmoid_gating_delta_rule_update
 from .fused_rearrange_recurrent import fused_rearrange_recurrent_gated_delta_rule
 from .fused_rearrange_sigmoid_gdr import fused_rearrange_sigmoid_gated_delta_rule
-from .fused_conv1d_rearrange_recurrent import fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule
 from .layernorm_guard import RMSNormGated
 
 __all__ = [
@@ -21,5 +20,4 @@ __all__ = [
     "fused_sigmoid_gating_delta_rule_update",
     "fused_rearrange_recurrent_gated_delta_rule",
     "fused_rearrange_sigmoid_gated_delta_rule",
-    "fused_causal_conv1d_update_rearrange_recurrent_gated_delta_rule",
 ]
