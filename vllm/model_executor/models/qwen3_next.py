@@ -101,6 +101,7 @@ from vllm.model_executor.layers.fla.ops import (
 )
 from vllm.model_executor.layers.mamba.ops.causal_conv1d_fast import (
     causal_conv1d_update_fast,
+    fused_reshape_causal_conv1d_update_fast,
 )
 
 logger = init_logger(__name__)
@@ -551,9 +552,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         # ============================================================
         projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
         projected_states_ba, _ = self.in_proj_ba(hidden_states)
-        mixed_qkv, z, b, a, core_attn_out = self.prepare_gdn_attention_core_inputs(
-            projected_states_qkvz, projected_states_ba, num_tokens
-        )
+        #mixed_qkv, z, b, a, core_attn_out = self.prepare_gdn_attention_core_inputs(
+        #    projected_states_qkvz, projected_states_ba, num_tokens
+        #)
 
         # ============================================================
         # Part 2: Core Attention (Custom Op)
@@ -565,11 +566,16 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
+        z = torch.zeros(
+            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+            dtype=projected_states_qkvz.dtype,
+            device=projected_states_qkvz.device,
+        )
 
         torch.ops.vllm.gdn_attention_core(
-            mixed_qkv,
-            b,
-            a,
+            projected_states_qkvz,
+            projected_states_ba,
+            z,
             core_attn_out,
             self.prefix,
         )
@@ -588,9 +594,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
     def _forward_core(
         self,
-        mixed_qkv: torch.Tensor,
-        b: torch.Tensor,
-        a: torch.Tensor,
+        qkvz: torch.Tensor,
+        ba: torch.Tensor,
+        z_out: torch.Tensor,
         core_attn_out: torch.Tensor,
     ):
         """
@@ -620,14 +626,24 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_accepted_tokens = attn_metadata.num_accepted_tokens
 
-        mixed_qkv = mixed_qkv[:num_actual_tokens]
-        b = b[:num_actual_tokens]
-        a = a[:num_actual_tokens]
+        ## back to original kernels
+        if spec_sequence_masks is not None or attn_metadata.num_prefills > 0:
+            ## TODO
+            mixed_qkv, b, a = self.prepare_gdn_attention_core_inputs(
+                qkvz, ba, z_out
+            )
+            mixed_qkv = mixed_qkv[:num_actual_tokens]
+            b = b[:num_actual_tokens]
+            a = a[:num_actual_tokens]
+
+        else:
+            mixed_qkv, b, a = None, None, None
 
         # 1. Convolution sequence transformation
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
+
 
         if spec_sequence_masks is not None:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
@@ -636,9 +652,12 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             else:
                 mixed_qkv_spec = mixed_qkv.index_select(0, spec_token_indx)
                 mixed_qkv_non_spec = mixed_qkv.index_select(0, non_spec_token_indx)
-        else:
+        elif attn_metadata.num_prefills > 0:
             mixed_qkv_spec = None
             mixed_qkv_non_spec = mixed_qkv
+        else:
+            mixed_qkv_spec = None
+            mixed_qkv_non_spec = None
 
         # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
@@ -674,17 +693,35 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 metadata=attn_metadata,
             ).transpose(0, 1)
         elif attn_metadata.num_decodes > 0:
-            mixed_qkv_non_spec = causal_conv1d_update_fast(
-                mixed_qkv_non_spec,
-                conv_state,
-                conv_weights,
-                self.conv1d.bias,
-                self.activation,
-                conv_state_indices=non_spec_state_indices_tensor[
-                    : attn_metadata.num_actual_tokens
-                ],
-                validate_data=True,
-            )
+            if mixed_qkv_non_spec is not None:
+                mixed_qkv_non_spec = causal_conv1d_update_fast(
+                    mixed_qkv_non_spec,
+                    conv_state,
+                    conv_weights,
+                    self.conv1d.bias,
+                    self.activation,
+                    conv_state_indices=non_spec_state_indices_tensor[
+                        : attn_metadata.num_actual_tokens
+                    ],
+                    validate_data=True,
+                )
+            else:
+                ### fuse qkvz, ba, to conv1d
+                mixed_qkv_non_spec, b, a = fused_reshape_causal_conv1d_update_fast(
+                    qkvz,
+                    ba,
+                    z_out,
+                    conv_state,
+                    conv_state,
+                    conv_weights,
+                    self.conv1d.bias,
+                    self.activation,
+                    conv_state_indices=non_spec_state_indices_tensor[
+                        : attn_metadata.num_actual_tokens
+                    ],
+                    validate_data=True,
+                    num_actual_tokens=num_actual_tokens,
+                )
         else:
             mixed_qkv_non_spec = None
 
@@ -1438,9 +1475,9 @@ class Qwen3NextForCausalLM(
 
 
 def gdn_attention_core(
-    mixed_qkv: torch.Tensor,
-    b: torch.Tensor,
-    a: torch.Tensor,
+    projected_qkvz: torch.Tensor,
+    projected_ba: torch.Tensor,
+    z_out: torch.Tensor,
     core_attn_out: torch.Tensor,
     layer_name: str,
 ) -> None:
@@ -1452,17 +1489,17 @@ def gdn_attention_core(
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
     self._forward_core(
-        mixed_qkv=mixed_qkv,
-        b=b,
-        a=a,
+        qkvz=projected_qkvz,
+        ba=projected_ba,
+        z_out=z_out,
         core_attn_out=core_attn_out,
     )
 
 
 def gdn_attention_core_fake(
-    mixed_qkv: torch.Tensor,
-    b: torch.Tensor,
-    a: torch.Tensor,
+    projected_qkvz: torch.Tensor,
+    projected_ba: torch.Tensor,
+    z_out: torch.Tensor,
     core_attn_out: torch.Tensor,
     layer_name: str,
 ) -> None:
