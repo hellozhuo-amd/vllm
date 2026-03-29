@@ -416,16 +416,16 @@ def _reshape_causal_conv1d_update_fast_kernel(
     stride_o_seq: tl.constexpr,
     stride_o_dim: tl.constexpr,
     stride_o_token: tl.constexpr,
-    stride_z_seq: tl.constexpr, # new
-    stride_ba_seq: tl.constexpr, # new
-    stride_ba_token: tl.constexpr, # new
-    stride_b_seq: tl.constexpr, # new
+    stride_z_seq: tl.constexpr,
+    stride_ba_seq: tl.constexpr,
+    stride_ba_token: tl.constexpr,
+    stride_b_seq: tl.constexpr,
     # others
     pad_slot_id: tl.constexpr,
-    num_program_write_z: tl.constexpr, # new
-    BLOCK_Z: tl.constexpr, # new
+    num_program_write_z: tl.constexpr,
+    BLOCK_Z: tl.constexpr,
+    HV: tl.constexpr,
     # Meta-parameters
-    HV: tl.constexpr, # new
     HAS_BIAS: tl.constexpr,
     KERNEL_WIDTH: tl.constexpr,
     SILU_ACTIVATION: tl.constexpr,
@@ -793,6 +793,7 @@ def fused_reshape_causal_conv1d_update_fast(
         pad_slot_id,
         num_program_write_z,
         BLOCK_Z,
+        HV=HV,
         # META
         HAS_BIAS=bias is not None,
         KERNEL_WIDTH=width,
