@@ -447,14 +447,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             value.reshape(num_tokens, -1)
         ], dim=-1)
 
-        # Note: we need zeros for the core_attn_out buffer
-        # see discussions in https://github.com/vllm-project/vllm/pull/28182
-        core_attn_zeros = torch.zeros(
-            num_tokens * (self.num_v_heads // self.tp_size) * self.head_v_dim,
-            dtype=mixed_qkvz.dtype,
-            device=mixed_qkvz.device
-        )
-
         # We flatten everything into a 1D sequence and concatenate. Inductor will launch
         # ONE Triton kernel to populate this single buffer.
         fused = torch.cat([
@@ -462,7 +454,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             z.reshape(-1),
             b.reshape(-1),
             a.reshape(-1),
-            core_attn_zeros  # (Already 1D)
         ], dim=0)
 
         # 4. Calculate offsets dynamically to slice the buffer back out
@@ -471,7 +462,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         z_numel = z.numel()
         b_numel = b.numel()
         a_numel = a.numel()
-        core_numel = core_attn_zeros.numel()
 
         # 5. Slice and reshape (Zero-copy metadata changes)
         mixed_qkv_out = fused[curr : curr + qkv_numel].view(num_tokens, -1)
@@ -486,11 +476,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         a_out = fused[curr : curr + a_numel].view(num_tokens, self.num_v_heads // self.tp_size)
         curr += a_numel
 
-        core_attn_out = fused[curr : curr + core_numel].view(
-            num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim
-        )
-
-        return mixed_qkv_out, z_out, b_out, a_out, core_attn_out
+        return mixed_qkv_out, z_out, b_out, a_out
 
 
     @torch.compile(fullgraph=True)
@@ -555,6 +541,8 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         #mixed_qkv, z, b, a, core_attn_out = self.prepare_gdn_attention_core_inputs(
         #    projected_states_qkvz, projected_states_ba, num_tokens
         #)
+        projected_states_qkvz = projected_qkvz.view(num_tokens, -1)
+        projected_states_ba = projected_ba.view(num_tokens, -1)
 
         # ============================================================
         # Part 2: Core Attention (Custom Op)
@@ -628,10 +616,11 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
         ## back to original kernels
         if spec_sequence_masks is not None or attn_metadata.num_prefills > 0:
-            ## TODO
-            mixed_qkv, b, a = self.prepare_gdn_attention_core_inputs(
-                qkvz, ba, z_out
+            num_tokens = qkvz.shape[0]
+            mixed_qkv, z, b, a = self.prepare_gdn_attention_core_inputs(
+                qkvz, ba, num_tokens
             )
+            z_out[:] = z
             mixed_qkv = mixed_qkv[:num_actual_tokens]
             b = b[:num_actual_tokens]
             a = a[:num_actual_tokens]
@@ -709,9 +698,13 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 ### fuse qkvz, ba, to conv1d
                 mixed_qkv_non_spec, b, a = fused_reshape_causal_conv1d_update_fast(
                     qkvz,
+                    num_actual_tokens,
+                    self.num_k_heads // self.tp_size,
+                    self.num_v_heads // self.tp_size,
+                    self.head_k_dim,
+                    self.head_v_dim,
                     ba,
                     z_out,
-                    conv_state,
                     conv_state,
                     conv_weights,
                     self.conv1d.bias,
@@ -720,7 +713,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                         : attn_metadata.num_actual_tokens
                     ],
                     validate_data=True,
-                    num_actual_tokens=num_actual_tokens,
                 )
         else:
             mixed_qkv_non_spec = None
