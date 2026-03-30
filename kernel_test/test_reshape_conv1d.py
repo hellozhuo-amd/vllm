@@ -191,13 +191,82 @@ def test(ipath, opath):
     compare_accuracy(z, z_fused)
     compare_accuracy(conv_state, conv_state_fused)
 
+def bench(ipath):
+
+    inputs = torch.load(ipath)
+    print(f"shape of inputs: {inputs['qkvz'].shape}")
+    num_tokens = inputs["qkvz"].shape[0]
+    num_actual_tokens = inputs["num_actual_tokens"]
+    key_dim = inputs["key_dim"]
+    value_dim = inputs["value_dim"]
+    head_k_dim = inputs["head_k_dim"]
+    head_v_dim = inputs["head_v_dim"]
+    num_k_heads = key_dim // head_k_dim
+    num_v_heads = value_dim // head_v_dim
+    z_fused = torch.zeros(
+        (num_tokens, num_v_heads, head_v_dim),
+        dtype=inputs["qkvz"].dtype,
+        device=inputs["qkvz"].device,
+    )
+
+    # --- Warmup (needed before graph capture) ---
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            fused_reshape_causal_conv1d_update_fast(
+                inputs["qkvz"],
+                num_actual_tokens,
+                num_k_heads,
+                num_v_heads,
+                head_k_dim,
+                head_v_dim,
+                inputs["ba"],
+                z_fused,
+                inputs["conv_state"],
+                inputs["weight"],
+                inputs["bias"],
+                inputs["activation"],
+                conv_state_indices=inputs["conv_state_indices"],
+                validate_data=True,
+            )
+    torch.cuda.current_stream().wait_stream(s)
+
+    # --- Capture graph ---
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=s):
+        fused_reshape_causal_conv1d_update_fast(
+            inputs["qkvz"],
+            num_actual_tokens,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            inputs["ba"],
+            z_fused,
+            inputs["conv_state"],
+            inputs["weight"],
+            inputs["bias"],
+            inputs["activation"],
+            conv_state_indices=inputs["conv_state_indices"],
+            validate_data=True,
+        )
+
+    # --- Bench the graph replay ---
+    def fn_graph():
+        graph.replay()
+
+    ms_graph = triton.testing.do_bench(fn_graph)
+
+    print(f"fused kernel via CUDA graph replay: {ms_graph:.6f} ms")
+
 def main():
 
     ipath = "/data/conv1d_tensors/4/input_1.pt"
     opath = "/data/conv1d_tensors/4/output_1.pt"
     
-    test(ipath, opath)
-    #bench(ipath)
+    #test(ipath, opath)
+    bench(ipath)
 
 if __name__ == "__main__":
     main()
