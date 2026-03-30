@@ -393,6 +393,25 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
 
     @torch.compile(fullgraph=True)
+    def prepare_output_buffer(
+        self,
+        num_tokens,
+        dtype,
+        device,
+    ):
+
+        core_out_numel = num_tokens * (self.num_v_heads // self.tp_size) * self.head_v_dim
+        z_numel = num_tokens * (self.num_v_heads // self.tp_size) * self.head_v_dim
+
+        fused = torch.zeros(core_out_numel + z_numel, dtype=dtype, device=device)
+
+        core_attn_out = fused[:core_out_numel].view(num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim)
+        z_out = fused[core_out_numel:].view(num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim)
+
+        return core_attn_out, z_out
+
+
+    @torch.compile(fullgraph=True)
     def prepare_gdn_attention_core_inputs(
         self,
         mixed_qkvz,
@@ -549,15 +568,23 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         # ============================================================
         # Note: we should not use torch.empty here like other attention backends,
         # see discussions in https://github.com/vllm-project/vllm/pull/28182
-        core_attn_out = torch.zeros(
-            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
-        z = torch.zeros(
-            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
-            dtype=projected_states_qkvz.dtype,
-            device=projected_states_qkvz.device,
+
+        #core_attn_out = torch.zeros(
+        #    (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+        #    dtype=hidden_states.dtype,
+        #    device=hidden_states.device,
+        #)
+        #z = torch.zeros(
+        #    (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+        #    dtype=projected_states_qkvz.dtype,
+        #    device=projected_states_qkvz.device,
+        #)
+
+        ## create buffer for core_attn_out and z, both with shape (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim)
+        core_attn_out, z = self.prepare_output_buffer(
+                num_tokens, 
+                dtype=projected_states_qkvz.dtype, 
+                device=projected_states_qkvz.device,
         )
 
         torch.ops.vllm.gdn_attention_core(

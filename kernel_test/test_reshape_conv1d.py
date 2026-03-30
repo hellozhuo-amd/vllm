@@ -265,8 +265,8 @@ def main():
     ipath = "/data/conv1d_tensors/4/input_1.pt"
     opath = "/data/conv1d_tensors/4/output_1.pt"
     
-    test(ipath, opath)
-    #bench(ipath)
+    #test(ipath, opath)
+    bench(ipath)
 
 if __name__ == "__main__":
     main()
