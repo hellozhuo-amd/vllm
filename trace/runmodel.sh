@@ -12,5 +12,5 @@ vllm bench serve \
     --max_concurrency 4 \
     --seed 1 \
     --port 8027 \
-    --num_warmups 4 \
-    --num_prompts 32
+    --num_warmups 0 \
+    --num_prompts 4

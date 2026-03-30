@@ -397,8 +397,6 @@ def _reshape_causal_conv1d_update_fast_kernel(
     head_k_dim: tl.constexpr,
     head_v_dim: tl.constexpr,
     dim: tl.constexpr,
-    qkvz_dim: tl.constexpr, # dim + z_dim
-    head_dim: tl.constexpr,
     head_qkvz_dim: tl.constexpr,
     seqlen: tl.constexpr,
     state_len: tl.constexpr,
@@ -440,7 +438,7 @@ def _reshape_causal_conv1d_update_fast_kernel(
         return
 
     ## write b, a
-    if tl.program_id(1) == 1:
+    if tl.program_id(1) == 0:
         ## HV = triton.next_power_of_2(num_v_heads)
         idx_hv = tl.arange(0, HV)
         ## map idx_hv to source idx
@@ -766,8 +764,6 @@ def fused_reshape_causal_conv1d_update_fast(
         head_k_dim,
         head_v_dim,
         dim,
-        qkvz_dim,
-        head_dim,
         head_qkvz_dim,
         seqlen,
         state_len,
