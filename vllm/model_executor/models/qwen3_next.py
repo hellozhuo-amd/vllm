@@ -803,7 +803,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 cu_seqlens=non_spec_query_start_loc,
                 head_first=False,
                 use_qk_l2norm_in_kernel=True,
-                core_attn_out = core_attn_out if spec_sequence_masks is None else None,
+                core_attn_out = core_attn_out.view(-1) if spec_sequence_masks is None else None,
             )
             # Init cache
             ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
@@ -828,7 +828,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                     ],
                     ssm_state_indices=non_spec_state_indices_tensor,
                     use_qk_l2norm_in_kernel=True,
-                    core_attn_out = core_attn_out if spec_sequence_masks is None else None,
+                    core_attn_out = core_attn_out.view(-1) if spec_sequence_masks is None else None,
                 )
             )
         else:
