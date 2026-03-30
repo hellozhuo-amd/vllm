@@ -208,6 +208,7 @@ def fused_rearrange_sigmoid_gated_delta_rule(
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
     is_kda: bool = False,
+    core_attn_out: torch.Tensor | None = None,
 ):
     r"""
     Fused triton implementation of sigmoid gating delta rule update.
@@ -265,19 +266,9 @@ def fused_rearrange_sigmoid_gated_delta_rule(
     num_stages = 3
     num_warps = 4
 
-    #if cu_seqlens is not None and q.shape[0] != 1:
-    #    raise ValueError(
-    #        f"The batch size is expected to be 1 rather than {q.shape[0]}"
-    #        f" when using `cu_seqlens`. Please flatten variable-length"
-    #        f" inputs before processing."
-    #    )
-    #if scale is None:
-    #    scale = k.shape[-1] ** -0.5
-    #else:
-    #    assert scale > 0, "scale must be positive"
-
     #o = q.new_empty(NK, *v.shape)
-    o = qkv.new_empty(NK, B, T, HV, V)
+    #o = qkv.new_empty(NK, B, T, HV, V)
+    o = core_attn_out[:NK*B*T*HV*V].view(NK, B, T, HV, V) if core_attn_out is not None else q.new_empty(NK, B, T, HV, V)
     if inplace_final_state:
         final_state = initial_state
     else:
