@@ -701,9 +701,9 @@ def fused_reshape_causal_conv1d_update_fast(
         assert num_cache_lines >= batch
         assert weight.stride(1) == 1  # Need this
 
-    out = torch.zeros((num_actual_tokens, dim, seqlen), dtype=x.dtype, device=x.device)
-    b_out = torch.zeros((num_actual_tokens, num_v_heads), dtype=ba.dtype, device=ba.device)
-    a_out = torch.zeros((num_actual_tokens, num_v_heads), dtype=ba.dtype, device=ba.device)
+    out = torch.empty((num_actual_tokens, dim, seqlen), dtype=x.dtype, device=x.device)
+    b_out = torch.empty((num_actual_tokens, num_v_heads), dtype=ba.dtype, device=ba.device)
+    a_out = torch.empty((num_actual_tokens, num_v_heads), dtype=ba.dtype, device=ba.device)
     ## adopt the strategy in vLLM that overwrite on 'x' directly, rather than creating a new tensor 'o'
     #out = x
     stride_w_dim, stride_w_width = weight.stride()
