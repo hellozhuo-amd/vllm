@@ -695,16 +695,19 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                     validate_data=True,
                 )
             else:
-                ### fuse qkvz, ba, to conv1d
-                mixed_qkv_non_spec, b, a = fused_reshape_causal_conv1d_update_fast(
-                    qkvz,
-                    num_actual_tokens,
-                    self.num_k_heads // self.tp_size,
-                    self.num_v_heads // self.tp_size,
-                    self.head_k_dim,
-                    self.head_v_dim,
-                    ba,
-                    z_out,
+                num_tokens = qkvz.shape[0]
+                mixed_qkv, z, b, a = self.prepare_gdn_attention_core_inputs(
+                    qkvz, ba, num_tokens
+                )
+                z_out[:] = z
+                mixed_qkv = mixed_qkv[:num_actual_tokens]
+                b = b[:num_actual_tokens]
+                a = a[:num_actual_tokens]
+
+                mixed_qkv_non_spec = mixed_qkv
+
+                mixed_qkv_non_spec = causal_conv1d_update_fast(
+                    mixed_qkv_non_spec,
                     conv_state,
                     conv_weights,
                     self.conv1d.bias,
@@ -714,6 +717,25 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                     ],
                     validate_data=True,
                 )
+                #### fuse qkvz, ba, to conv1d
+                #mixed_qkv_non_spec, b, a = fused_reshape_causal_conv1d_update_fast(
+                #    qkvz,
+                #    num_actual_tokens,
+                #    self.num_k_heads // self.tp_size,
+                #    self.num_v_heads // self.tp_size,
+                #    self.head_k_dim,
+                #    self.head_v_dim,
+                #    ba,
+                #    z_out,
+                #    conv_state,
+                #    conv_weights,
+                #    self.conv1d.bias,
+                #    self.activation,
+                #    conv_state_indices=non_spec_state_indices_tensor[
+                #        : attn_metadata.num_actual_tokens
+                #    ],
+                #    validate_data=True,
+                #)
         else:
             mixed_qkv_non_spec = None
 
