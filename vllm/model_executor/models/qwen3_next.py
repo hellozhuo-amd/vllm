@@ -642,18 +642,14 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         num_accepted_tokens = attn_metadata.num_accepted_tokens
 
         ## back to original kernels
-        if spec_sequence_masks is not None or attn_metadata.num_prefills > 0:
-            num_tokens = qkvz.shape[0]
-            mixed_qkv, z, b, a = self.prepare_gdn_attention_core_inputs(
-                qkvz, ba, num_tokens
-            )
-            z_out[:] = z
-            mixed_qkv = mixed_qkv[:num_actual_tokens]
-            b = b[:num_actual_tokens]
-            a = a[:num_actual_tokens]
-
-        else:
-            mixed_qkv, b, a = None, None, None
+        num_tokens = qkvz.shape[0]
+        mixed_qkv, z, b, a = self.prepare_gdn_attention_core_inputs(
+            qkvz, ba, num_tokens
+        )
+        z_out[:] = z
+        mixed_qkv = mixed_qkv[:num_actual_tokens]
+        b = b[:num_actual_tokens]
+        a = a[:num_actual_tokens]
 
         # 1. Convolution sequence transformation
         conv_weights = self.conv1d.weight.view(
@@ -668,12 +664,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             else:
                 mixed_qkv_spec = mixed_qkv.index_select(0, spec_token_indx)
                 mixed_qkv_non_spec = mixed_qkv.index_select(0, non_spec_token_indx)
-        elif attn_metadata.num_prefills > 0:
-            mixed_qkv_spec = None
-            mixed_qkv_non_spec = mixed_qkv
         else:
             mixed_qkv_spec = None
-            mixed_qkv_non_spec = None
+            mixed_qkv_non_spec = mixed_qkv
 
         # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
@@ -709,38 +702,38 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 metadata=attn_metadata,
             ).transpose(0, 1)
         elif attn_metadata.num_decodes > 0:
-            if mixed_qkv_non_spec is not None:
-                mixed_qkv_non_spec = causal_conv1d_update_fast(
-                    mixed_qkv_non_spec,
-                    conv_state,
-                    conv_weights,
-                    self.conv1d.bias,
-                    self.activation,
-                    conv_state_indices=non_spec_state_indices_tensor[
-                        : attn_metadata.num_actual_tokens
-                    ],
-                    validate_data=True,
-                )
-            else:
-                ### fuse qkvz, ba, to conv1d
-                mixed_qkv_non_spec, b, a = fused_reshape_causal_conv1d_update_fast(
-                    qkvz,
-                    num_actual_tokens,
-                    self.num_k_heads // self.tp_size,
-                    self.num_v_heads // self.tp_size,
-                    self.head_k_dim,
-                    self.head_v_dim,
-                    ba,
-                    z_out,
-                    conv_state,
-                    conv_weights,
-                    self.conv1d.bias,
-                    self.activation,
-                    conv_state_indices=non_spec_state_indices_tensor[
-                        : attn_metadata.num_actual_tokens
-                    ],
-                    validate_data=True,
-                )
+            #if mixed_qkv_non_spec is not None:
+            mixed_qkv_non_spec = causal_conv1d_update_fast(
+                mixed_qkv_non_spec,
+                conv_state,
+                conv_weights,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=non_spec_state_indices_tensor[
+                    : attn_metadata.num_actual_tokens
+                ],
+                validate_data=True,
+            )
+            #else:
+            #    ### fuse qkvz, ba, to conv1d
+            #    mixed_qkv_non_spec, b, a = fused_reshape_causal_conv1d_update_fast(
+            #        qkvz,
+            #        num_actual_tokens,
+            #        self.num_k_heads // self.tp_size,
+            #        self.num_v_heads // self.tp_size,
+            #        self.head_k_dim,
+            #        self.head_v_dim,
+            #        ba,
+            #        z_out,
+            #        conv_state,
+            #        conv_weights,
+            #        self.conv1d.bias,
+            #        self.activation,
+            #        conv_state_indices=non_spec_state_indices_tensor[
+            #            : attn_metadata.num_actual_tokens
+            #        ],
+            #        validate_data=True,
+            #    )
         else:
             mixed_qkv_non_spec = None
 
