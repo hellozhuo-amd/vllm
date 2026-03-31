@@ -5,6 +5,8 @@
 from collections.abc import Iterable
 from itertools import islice
 
+import os
+
 import torch
 from einops import rearrange
 from torch import nn
@@ -604,6 +606,19 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         z_shape_og = z.shape
         # Reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
+
+        dirname = f"/tmp/profile/gdn_tensors"
+        os.makedirs(dirname, exist_ok=True)
+        nf = len(os.listdir(dirname))
+        if nf < 2:
+            torch.save({
+                "core_attn_out": core_attn_out,
+                "z": z,
+                "output": output,
+                "num_tokens": num_tokens,
+                }, os.path.join(dirname, f"tensor_{nf+1}.pt")
+            )
+
         z = z.reshape(-1, z.shape[-1])
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
