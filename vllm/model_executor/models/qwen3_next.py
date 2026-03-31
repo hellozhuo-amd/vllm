@@ -458,18 +458,12 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         (query, key, value, z) = torch.split(mixed_qkvz, split_arg_list_qkvz, dim=-1)
         (b, a) = torch.split(mixed_ba, split_arg_list_ba, dim=-1)
 
-        # 1. Interleave Q, K, V logically.
-        # Inside compile, this doesn't allocate memory yet; it just creates an indexing map.
-        mixed_qkv_logical = torch.cat([
-            query.reshape(num_tokens, -1),
-            key.reshape(num_tokens, -1),
-            value.reshape(num_tokens, -1)
-        ], dim=-1)
-
         # We flatten everything into a 1D sequence and concatenate. Inductor will launch
         # ONE Triton kernel to populate this single buffer.
         fused = torch.cat([
-            mixed_qkv_logical.reshape(-1),
+            query.reshape(-1),
+            key.reshape(-1),
+            value.reshape(-1),
             z.reshape(-1),
             b.reshape(-1),
             a.reshape(-1),
@@ -477,7 +471,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
         # 4. Calculate offsets dynamically to slice the buffer back out
         curr = 0
-        qkv_numel = mixed_qkv_logical.numel()
+        qkv_numel = qeury.numel() + key.numel() + value.numel()
         z_numel = z.numel()
         b_numel = b.numel()
         a_numel = a.numel()
@@ -493,7 +487,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         curr += b_numel
 
         a_out = fused[curr : curr + a_numel].view(num_tokens, self.num_v_heads // self.tp_size)
-        curr += a_numel
 
         return mixed_qkv_out, z_out, b_out, a_out
 
@@ -560,6 +553,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         #mixed_qkv, z, b, a, core_attn_out = self.prepare_gdn_attention_core_inputs(
         #    projected_states_qkvz, projected_states_ba, num_tokens
         #)
+        print(f"qkvz shape {projected_states_qkvz.shape}, ba shape {projected_states_ba.shape}, num_tokens {num_tokens}\n") 
         projected_states_qkvz = projected_states_qkvz.view(num_tokens, -1)
         projected_states_ba = projected_states_ba.view(num_tokens, -1)
 
