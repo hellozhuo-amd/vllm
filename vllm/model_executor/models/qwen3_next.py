@@ -1484,7 +1484,7 @@ class Qwen3NextForCausalLM(
 def gdn_attention_core(
     projected_qkvz: torch.Tensor,
     projected_ba: torch.Tensor,
-    z_out: torch.Tensor,
+    z: torch.Tensor,
     core_attn_out: torch.Tensor,
     layer_name: str,
 ) -> None:
@@ -1498,7 +1498,7 @@ def gdn_attention_core(
     self._forward_core(
         qkvz=projected_qkvz,
         ba=projected_ba,
-        z_out=z_out,
+        z_out=z,
         core_attn_out=core_attn_out,
     )
 
@@ -1506,7 +1506,7 @@ def gdn_attention_core(
 def gdn_attention_core_fake(
     projected_qkvz: torch.Tensor,
     projected_ba: torch.Tensor,
-    z_out: torch.Tensor,
+    z: torch.Tensor,
     core_attn_out: torch.Tensor,
     layer_name: str,
 ) -> None:
@@ -1517,7 +1517,7 @@ def gdn_attention_core_fake(
 direct_register_custom_op(
     op_name="gdn_attention_core",
     op_func=gdn_attention_core,
-    mutates_args=["core_attn_out", "z_out"],
+    mutates_args=["core_attn_out", "z"],
     fake_impl=gdn_attention_core_fake,
 )
 
