@@ -607,23 +607,55 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         # Reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
 
-        import pdb
-        pdb.set_trace()
-
         dirname = f"/tmp/profile/gdn_tensors"
         os.makedirs(dirname, exist_ok=True)
         nf = len(os.listdir(dirname))
         if nf < 2:
+            # Save input/output tensors
             torch.save({
                 "core_attn_out": core_attn_out,
                 "z": z,
                 "output": output,
                 "num_tokens": num_tokens,
                 "head_v_dim": self.head_v_dim,
-                "value_dim": self.value_dim,
-                "hidden_size": self.hidden_size,
                 }, os.path.join(dirname, f"tensor_{nf+1}.pt")
             )
+            
+            # Save out_proj with quantization config
+            quant_config_dict = None
+            if self.quant_config is not None:
+                # Serialize quant_config by extracting its attributes
+                quant_config_dict = {
+                    "quant_method": self.quant_config.get_name(),
+                }
+                # Extract common quantization config attributes
+                for attr in ["is_checkpoint_fp8_serialized", "activation_scheme", 
+                             "ignored_layers", "weight_block_size", "group_size", 
+                             "bits", "zero_point", "desc_act"]:
+                    if hasattr(self.quant_config, attr):
+                        val = getattr(self.quant_config, attr)
+                        # Only save serializable values
+                        if val is None or isinstance(val, (int, float, str, bool, list, dict)):
+                            quant_config_dict[attr] = val
+            
+            torch.save({
+                # Module state
+                "state_dict": self.out_proj.state_dict(),
+                # Reconstruction config
+                "config": {
+                    "input_size": self.value_dim,
+                    "output_size": self.hidden_size,
+                    "bias": False,
+                    "input_is_parallel": True,
+                    "tp_size": self.tp_size,
+                    "tp_rank": self.tp_rank,
+                },
+                # Quantization config (for full recreation)
+                "quant_config": quant_config_dict,
+                # For direct inference without reconstruction
+                "weight": self.out_proj.weight.data.clone(),
+            }, os.path.join(dirname, f"out_proj_{nf+1}.pt"))
+
 
         z = z.reshape(-1, z.shape[-1])
         core_attn_out = self.norm(core_attn_out, z)
