@@ -1517,7 +1517,7 @@ def gdn_attention_core_fake(
 direct_register_custom_op(
     op_name="gdn_attention_core",
     op_func=gdn_attention_core,
-    mutates_args=["core_attn_out"],
+    mutates_args=["core_attn_out", "z_out"],
     fake_impl=gdn_attention_core_fake,
 )
 
