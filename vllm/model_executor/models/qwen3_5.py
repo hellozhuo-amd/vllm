@@ -130,6 +130,21 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
             "Qwen3.5 Series dont need to fix query key value ordering"
         )
 
+    def prepare_gdn_attention_core_inputs(
+        self,
+        mixed_qkvz: torch.Tensor,
+        mixed_ba: torch.Tensor,
+        num_tokens: int,
+    ):
+        assert num_tokens == mixed_qkvz.shape[0]
+        qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
+        z_size = self.value_dim // self.tp_size
+        mixed_qkv, z_flat = mixed_qkvz.split([qkv_size, z_size], dim=-1)
+        n = mixed_qkvz.shape[0]
+        z_out = z_flat.reshape(n, -1, self.head_v_dim)
+        b, a = mixed_ba.chunk(2, dim=-1)
+        return mixed_qkv, z_out, b, a
+
     def create_qkvz_proj(
         self,
         hidden_size: int,
@@ -180,16 +195,10 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
-        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-        qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
-        z_size = self.value_dim // self.tp_size
-        mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
-        z = z.reshape(z.size(0), -1, self.head_v_dim)
-        ba, _ = self.in_proj_ba(hidden_states)
-        b, a = ba.chunk(2, dim=-1)
-
-        b = b.contiguous()
-        a = a.contiguous()
+        projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+        projected_states_ba, _ = self.in_proj_ba(hidden_states)
+        projected_states_qkvz = projected_states_qkvz.view(num_tokens, -1)
+        projected_states_ba = projected_states_ba.view(num_tokens, -1)
 
         # ============================================================
         # Part 2: Core Attention (Custom Op)
@@ -201,11 +210,16 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
+        z = torch.zeros(
+            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+            dtype=projected_states_qkvz.dtype,
+            device=projected_states_qkvz.device,
+        )
 
         torch.ops.vllm.gdn_attention_core(
-            mixed_qkv,
-            b,
-            a,
+            projected_states_qkvz,
+            projected_states_ba,
+            z,
             core_attn_out,
             self.prefix,
         )
