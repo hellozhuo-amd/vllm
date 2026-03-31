@@ -607,6 +607,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         # Reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
 
+        import pdb
+        pdb.set_trace()
+
         dirname = f"/tmp/profile/gdn_tensors"
         os.makedirs(dirname, exist_ok=True)
         nf = len(os.listdir(dirname))
@@ -616,6 +619,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 "z": z,
                 "output": output,
                 "num_tokens": num_tokens,
+                "head_v_dim": self.head_v_dim,
+                "value_dim": self.value_dim,
+                "hidden_size": self.hidden_size,
                 }, os.path.join(dirname, f"tensor_{nf+1}.pt")
             )
 
