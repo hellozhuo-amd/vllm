@@ -553,7 +553,8 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         #mixed_qkv, z, b, a, core_attn_out = self.prepare_gdn_attention_core_inputs(
         #    projected_states_qkvz, projected_states_ba, num_tokens
         #)
-        print(f"qkvz shape {projected_states_qkvz.shape}, ba shape {projected_states_ba.shape}, num_tokens {num_tokens}\n") 
+        with open("/tmp/fusion_4_debug.log", "a") as f:
+            f.write(f"qkvz shape {projected_states_qkvz.shape}, ba shape {projected_states_ba.shape}, num_tokens {num_tokens}\n") 
         projected_states_qkvz = projected_states_qkvz.view(num_tokens, -1)
         projected_states_ba = projected_states_ba.view(num_tokens, -1)
 
