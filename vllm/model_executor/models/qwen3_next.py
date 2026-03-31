@@ -642,18 +642,14 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         num_accepted_tokens = attn_metadata.num_accepted_tokens
 
         ## back to original kernels
-        if spec_sequence_masks is not None or attn_metadata.num_prefills > 0:
-            num_tokens = qkvz.shape[0]
-            mixed_qkv, z, b, a = self.prepare_gdn_attention_core_inputs(
-                qkvz, ba, num_tokens
-            )
-            z_out[:] = z
-            mixed_qkv = mixed_qkv[:num_actual_tokens]
-            b = b[:num_actual_tokens]
-            a = a[:num_actual_tokens]
-
-        else:
-            mixed_qkv, b, a = None, None, None
+        num_tokens = qkvz.shape[0]
+        mixed_qkv, z, b, a = self.prepare_gdn_attention_core_inputs(
+            qkvz, ba, num_tokens
+        )
+        z_out[:] = z
+        mixed_qkv = mixed_qkv[:num_actual_tokens]
+        b = b[:num_actual_tokens]
+        a = a[:num_actual_tokens]
 
         # 1. Convolution sequence transformation
         conv_weights = self.conv1d.weight.view(
@@ -668,12 +664,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             else:
                 mixed_qkv_spec = mixed_qkv.index_select(0, spec_token_indx)
                 mixed_qkv_non_spec = mixed_qkv.index_select(0, non_spec_token_indx)
-        elif attn_metadata.num_prefills > 0:
-            mixed_qkv_spec = None
-            mixed_qkv_non_spec = mixed_qkv
         else:
             mixed_qkv_spec = None
-            mixed_qkv_non_spec = None
+            mixed_qkv_non_spec = mixed_qkv
 
         # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
