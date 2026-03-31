@@ -560,6 +560,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         #mixed_qkv, z, b, a, core_attn_out = self.prepare_gdn_attention_core_inputs(
         #    projected_states_qkvz, projected_states_ba, num_tokens
         #)
+
+        assert projected_states_qkvz.shape[0] == num_tokens, f"length of projected_states_qkvz is expected to be {num_tokens}, got {projected_states_qkvz.shape[0]}"
+        assert projected_states_ba.shape[0] == num_tokens, f"length of projected_states_ba is expected to be {num_tokens}, got {projected_states_ba.shape[0]}"
         projected_states_qkvz = projected_states_qkvz.view(num_tokens, -1)
         projected_states_ba = projected_states_ba.view(num_tokens, -1)
 
@@ -1529,7 +1532,7 @@ def gdn_attention_core_fake(
 direct_register_custom_op(
     op_name="gdn_attention_core",
     op_func=gdn_attention_core,
-    mutates_args=["core_attn_out"],
+    mutates_args=["core_attn_out", "z_out"],
     fake_impl=gdn_attention_core_fake,
 )
 
