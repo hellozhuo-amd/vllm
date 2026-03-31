@@ -471,7 +471,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
         # 4. Calculate offsets dynamically to slice the buffer back out
         curr = 0
-        qkv_numel = qeury.numel() + key.numel() + value.numel()
+        qkv_numel = query.numel() + key.numel() + value.numel()
         z_numel = z.numel()
         b_numel = b.numel()
         a_numel = a.numel()
@@ -553,8 +553,8 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         #mixed_qkv, z, b, a, core_attn_out = self.prepare_gdn_attention_core_inputs(
         #    projected_states_qkvz, projected_states_ba, num_tokens
         #)
-        with open("/tmp/fusion_4_debug.log", "a") as f:
-            f.write(f"qkvz shape {projected_states_qkvz.shape}, ba shape {projected_states_ba.shape}, num_tokens {num_tokens}\n") 
+        assert projected_states_qkvz.shape[0] == num_tokens, f"length of projected_states_qkvz is expected to be {num_tokens}, got {projected_states_qkvz.shape[0]}"
+        assert projected_states_ba.shape[0] == num_tokens, f"length of projected_states_ba is expected to be {num_tokens}, got {projected_states_ba.shape[0]}"
         projected_states_qkvz = projected_states_qkvz.view(num_tokens, -1)
         projected_states_ba = projected_states_ba.view(num_tokens, -1)
 
