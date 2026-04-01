@@ -71,7 +71,6 @@ def rms_norm_input_quant_fp8_kernel(
     FP8_MAX: tl.constexpr,
     USE_UE8M0: tl.constexpr,
     FP8_MIN_SCALING_FACTOR: tl.constexpr,
-    FP8_DTYPE: tl.constexpr,
 ):
     # Map the program id to the starting row of X and Y it should compute.
     row_start = tl.program_id(0) * ROWS_PER_BLOCK
@@ -143,7 +142,7 @@ def rms_norm_input_quant_fp8_kernel(
     y_quant = tl.maximum(tl.minimum(y_scaled, FP8_MAX), FP8_MIN)
     
     # Store quantized output
-    tl.store(Y_base, y_quant.to(FP8_DTYPE), mask=mask)
+    tl.store(Y_base, y_quant.to(Y_quant.dtype.element_ty), mask=mask)
     
     # Store scales (one per row)
     scales_row_mask = rows < M
@@ -452,7 +451,6 @@ class QuantFP8(CustomOp):
             FP8_MAX=_FP8_MAX,
             USE_UE8M0=self.use_ue8m0,
             FP8_MIN_SCALING_FACTOR=_FP8_MIN_SCALING_FACTOR,
-            FP8_DTYPE=_FP8_DTYPE,
             num_warps=num_warps,
         )
 
