@@ -4,6 +4,8 @@
 import torch
 import torch.nn.functional as F
 
+from functools import lru_cache
+
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv, next_power_of_2
 
@@ -26,6 +28,13 @@ from vllm.utils.deep_gemm import (
 _FP8_DTYPE = current_platform.fp8_dtype()
 _FP8_MIN, _FP8_MAX = get_fp8_min_max()
 _FP8_MIN_SCALING_FACTOR = 1.0 / (_FP8_MAX * 512.0)
+
+
+@lru_cache
+def _get_sm_count(device: torch.device) -> int:
+    """Get and cache the SM count for a given device."""
+    props = torch.cuda.get_device_properties(device)
+    return props.multi_processor_count
 
 def calc_rows_per_block(M: int, device: torch.device) -> int:
     sm_count = _get_sm_count(device)
