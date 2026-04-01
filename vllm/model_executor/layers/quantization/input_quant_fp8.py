@@ -4,6 +4,9 @@
 import torch
 import torch.nn.functional as F
 
+from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import cdiv, next_power_of_2
+
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.model_executor.custom_op import CustomOp
