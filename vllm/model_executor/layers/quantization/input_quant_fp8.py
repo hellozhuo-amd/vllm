@@ -393,9 +393,10 @@ class QuantFP8(CustomOp):
         assert x.is_contiguous(), "x should be contiguous"
         assert z.is_contiguous(), "z should be contiguous"
 
+        num_tokens, num_heads, head_dim = z.shape
+        x = x.view(-1, head_dim)
+        z = z.view(-1, head_dim)
         assert x.size() == z.size(), "x and z should have the same shape"
-        num_tokens, num_heads, head_dim = x.shape
-
         assert self.group_size == head_dim, f"the kernel is only supported for group_size == head_dim, got group_size {self.group_size} and head_dim {head_dim}"
 
         weight = weight.contiguous()
@@ -403,8 +404,6 @@ class QuantFP8(CustomOp):
             bias = bias.contiguous()
 
         ## now we do the job
-        x = x.view(-1, head_dim)
-        z = z.view(-1, head_dim)
         M = x.shape[0]
         group_size = head_dim
         ngroups = 1
