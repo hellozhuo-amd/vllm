@@ -11,7 +11,8 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm._aiter_ops import rocm_aiter_ops
+from vllm.model_executor.layers.fused_moe import FusedMoE, SharedFusedMoE
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -145,12 +146,14 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+        expert_params_mapping = SharedFusedMoE.make_expert_params_mapping(
             self,
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+            num_experts=self.config.num_experts
+            + (1 if rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+               else 0),
         )
 
         params_dict = dict(self.named_parameters())
@@ -159,11 +162,18 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
 
+            is_fusion_moe_shared_experts_layer = (
+                rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+                and ("mlp.shared_expert" in name)
+            )
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
 
                 if "mlp.experts" in name:
+                    continue
+                if is_fusion_moe_shared_experts_layer:
                     continue
 
                 name = name.replace(weight_name, param_name)
@@ -193,6 +203,8 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
                         name.endswith(".bias") or name.endswith("_bias")
                     ) and name not in params_dict:
                         continue
+                    if name not in params_dict:
+                        continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
@@ -208,6 +220,12 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
                     if name.endswith(".bias") and name not in params_dict:
                         continue
                     if is_pp_missing_parameter(name, self):
+                        continue
+                    if name not in params_dict:
+                        logger.warning_once(
+                            f"Parameter {name} not found in params_dict, "
+                            "skip loading"
+                        )
                         continue
 
                     param = params_dict[name]
