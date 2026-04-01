@@ -211,6 +211,7 @@ class QuantFP8(CustomOp):
         scale: torch.Tensor | None = None,
         scale_ub: torch.Tensor | None = None,
         use_triton: bool = False,
+        rms_norm_parameters: dict | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from vllm.model_executor.layers.quantization.utils import fp8_utils
 
@@ -261,6 +262,7 @@ class QuantFP8(CustomOp):
         scale: torch.Tensor | None = None,
         scale_ub: torch.Tensor | None = None,
         use_triton: bool = False,
+        rms_norm_parameters: dict | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
         if self.is_group_quant and use_triton:

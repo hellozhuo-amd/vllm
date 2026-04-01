@@ -616,6 +616,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             "eps": self.norm.eps,
             "norm_before_gate": self.norm.norm_before_gate,
         }
+        core_attn_out = core_attn_out.view(num_tokens, -1)
         output[:num_tokens], _ = self.out_proj(core_attn_out, rms_norm_parameters)
 
     def _forward_core(
