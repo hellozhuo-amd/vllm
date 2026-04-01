@@ -429,7 +429,7 @@ class QuantFP8(CustomOp):
         rows_per_block = calc_rows_per_block(M, x.device)
 
         x_quant = torch.empty_like(x, dtype=_FP8_DTYPE)
-        scales = torch.empty(M, dtype=_FP8_DTYPE, device=x.device)
+        scales = torch.empty(M, dtype=torch.float32, device=x.device)
 
         grid = (cdiv(M, rows_per_block), ngroups)
         rms_norm_input_quant_fp8_kernel[grid](
