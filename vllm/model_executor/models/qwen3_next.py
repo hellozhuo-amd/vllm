@@ -230,6 +230,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             _, final_hidden_states = final_hidden_states
 
         if self.shared_expert is not None:
+            # Auto triton kernel #1
             final_hidden_states = final_hidden_states[0] + final_hidden_states[1]
 
         if self.is_sequence_parallel:

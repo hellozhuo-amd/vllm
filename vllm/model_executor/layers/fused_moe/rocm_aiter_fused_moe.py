@@ -396,4 +396,5 @@ class AiterExperts(mk.FusedMoEPermuteExpertsUnpermute):
             num_local_tokens=num_local_tokens,
             output_dtype=output.dtype,
         )
+        # Auto copy kernel #3
         output.copy_(result)
