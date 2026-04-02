@@ -1,0 +1,16 @@
+vllm bench serve   \
+    --backend vllm   \
+    --dataset_name random   \
+    --ignore_eos   \
+    --model Qwen/Qwen3-Next-80B-A3B-Instruct-FP8   \
+    --ready_check_timeout_sec 7200   \
+    --percentile_metrics ttft,tpot,itl,e2el   \
+    --temperature 0   \
+    --random_input_len 1024   \
+    --random_output_len 8   \
+    --max_concurrency 4   \
+    --seed 1   \
+    --num_warmups 4   \
+    --num_prompts 8 \
+    --port=8027 \
+    --profile
