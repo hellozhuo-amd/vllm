@@ -230,7 +230,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             _, final_hidden_states = final_hidden_states
 
         if self.shared_expert is not None:
-            # Auto triton kernel #1
+            ## Auto triton kernel #1
             final_hidden_states = final_hidden_states[0] + final_hidden_states[1]
 
         if self.is_sequence_parallel:
@@ -467,7 +467,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         mixed_qkv_out = fused[curr : curr + qkv_numel].view(num_tokens, -1)
         curr += qkv_numel
 
-        z_out = fused[curr : curr + z_numel].view(num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim)
+        z_out = fused[curr : curr + z_numel].view(num_tokens, -1, self.head_v_dim)
         curr += z_numel
 
         b_out = fused[curr : curr + b_numel].view(num_tokens, self.num_v_heads // self.tp_size)
@@ -579,13 +579,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         # ============================================================
         # Part 3: Output Projection
         # ============================================================
-        # z_shape_og = z.shape
-        #  Reshape input data into 2D tensor
-        # core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        # z = z.reshape(-1, z.shape[-1])
-        # core_attn_out = self.norm(core_attn_out, z)
-        # core_attn_out = core_attn_out.reshape(z_shape_og)
-        # core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         rms_norm_parameters = {
             "z": z,
             "weight": self.norm.weight,
@@ -1491,7 +1484,7 @@ class Qwen3NextForCausalLM(
 def gdn_attention_core(
     projected_qkvz: torch.Tensor,
     projected_ba: torch.Tensor,
-    z: torch.Tensor,
+    z_out: torch.Tensor,
     core_attn_out: torch.Tensor,
     layer_name: str,
 ) -> None:
@@ -1505,7 +1498,7 @@ def gdn_attention_core(
     self._forward_core(
         qkvz=projected_qkvz,
         ba=projected_ba,
-        z_out=z,
+        z_out=z_out,
         core_attn_out=core_attn_out,
     )
 
@@ -1513,7 +1506,7 @@ def gdn_attention_core(
 def gdn_attention_core_fake(
     projected_qkvz: torch.Tensor,
     projected_ba: torch.Tensor,
-    z: torch.Tensor,
+    z_out: torch.Tensor,
     core_attn_out: torch.Tensor,
     layer_name: str,
 ) -> None:
@@ -1524,7 +1517,7 @@ def gdn_attention_core_fake(
 direct_register_custom_op(
     op_name="gdn_attention_core",
     op_func=gdn_attention_core,
-    mutates_args=["z", "core_attn_out"],
+    mutates_args=["z_out", "core_attn_out"],
     fake_impl=gdn_attention_core_fake,
 )
 
