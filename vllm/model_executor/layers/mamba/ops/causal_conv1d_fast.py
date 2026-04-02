@@ -381,6 +381,7 @@ def _reshape_causal_conv1d_update_fast_kernel(
     x_ptr,  # (num_tokens, dim+z_dim, seqlen) where seqlen=1
     ba_ptr,
     z_ptr, # (num_tokens, num_v_heads, head_v_dim)
+    core_attn_out_ptr, # (num_tokens, num_v_heads, head_v_dim)
     b_ptr, # (num_accepted_tokens, num_v_heads)
     a_ptr, # (num_accepted_tokens, num_v_heads)
     w_ptr,  # (dim, width)
@@ -392,6 +393,7 @@ def _reshape_causal_conv1d_update_fast_kernel(
     o_ptr,  # (num_accepted_tokens, dim, seqlen)
     # Matrix dimensions
     batch: int,
+    num_tokens: int,
     num_k_heads: tl.constexpr,
     num_v_heads: tl.constexpr,
     head_k_dim: tl.constexpr,
@@ -467,6 +469,20 @@ def _reshape_causal_conv1d_update_fast_kernel(
         z = tl.load(z_source_ptrs, mask=mask_z, other=0.0)
         z_ptrs = z_ptr + idx_seq * stride_z_seq + idx_z
         tl.store(z_ptrs, z, mask=mask_z)
+
+        ## zero-fill core_attn_out
+        # first, zero_fill [0, batch) for core_attn_out
+        core_attn_out_ptrs = core_attn_out_ptr + idx_seq * stride_z_seq + idx_z
+        tl.store(core_attn_out_ptrs, 0.0, mask=mask_z)
+        # second, zero_fill [batch, num_tokens) for both z and core_attn_out
+        n_repeat = (num_tokens - 1) // batch
+        for idx_repeat in tl.range(n_repeat):
+            idx_seq_remain = batch * (1 + idx_repeat) + idx_seq
+            z_ptrs = z_ptr + idx_seq_remain * stride_z_seq + idx_z
+            core_attn_out_ptrs = core_attn_out_ptr + idx_seq_remain * stride_z_seq + idx_z
+            mask_remain = (idx_seq_remain < num_tokens) & mask_z
+            tl.store(z_ptrs, 0.0, mask=mask_remain)
+            tl.store(core_attn_out_ptrs, 0.0, mask=mask_remain)
     ## do regular causal conv1d udpate
     else:
         # [BLOCK_N,] elements along the feature-dimension (channel)
@@ -623,6 +639,7 @@ def fused_reshape_causal_conv1d_update_fast(
     head_v_dim: int,
     ba: torch.Tensor, 
     z_out: torch.Tensor, 
+    core_attn_out: torch.Tensor, # just to zero-fill it
     conv_state: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
@@ -642,6 +659,7 @@ def fused_reshape_causal_conv1d_update_fast(
         x: qkvz, can be viewed (num_tokens, qkvz_dim)
         ba: can be viewed (num_tokens, 2 * num_v_heads)
         z_out: (num_tokens, num_v_heads, head_v_dim)
+        core_attn_out: (num_tokens, num_v_heads, head_v_dim)
     Outputs:
         mixed_qkv (out): (num_actual_tokens, dim)
         b: (num_actual_tokens, num_v_heads)
@@ -651,10 +669,14 @@ def fused_reshape_causal_conv1d_update_fast(
     assert num_accepted_tokens is None, f"num_accepted_tokens must be None, got {num_accepted_tokens}"
     assert query_start_loc is None, f"query_start_loc must be None, got {query_start_loc}"
     assert z_out.is_contiguous(), "z_out should be contiguous if it was created by torch.zeros()"
+    assert core_attn_out.is_contiguous(), "core_attn_out should be contiguous if it was created by torch.zeros()"
     x = x.view(x.shape[0], -1)
     ba = ba.view(ba.shape[0], -1)
+    assert z_out.size() == core_attn_out.size(), "z_out and core_attn_out should have the same shape"
     original_z_shape = z_out.shape
+    num_tokens = z_out.shape[0]
     z_out = z_out.view(original_z_shape[0], -1)
+    core_attn_out = core_attn_out.view(original_z_shape[0], -1)
     if validate_data:
         assert pad_slot_id is not None
         assert x.stride(1) == 1
@@ -742,12 +764,12 @@ def fused_reshape_causal_conv1d_update_fast(
             batch,
             1 + num_program_write_z + triton.cdiv(dim, META["BLOCK_N"]),
         )
-
     _reshape_causal_conv1d_update_fast_kernel[grid](
         # Pointers to matrices
         x,
         ba,
         z_out,
+        core_attn_out,
         b_out,
         a_out,
         weight,
@@ -759,6 +781,7 @@ def fused_reshape_causal_conv1d_update_fast(
         out,
         # Matrix dimensions
         batch,
+        num_tokens,
         num_k_heads,
         num_v_heads,
         head_k_dim,
@@ -802,5 +825,6 @@ def fused_reshape_causal_conv1d_update_fast(
     if unsqueeze:
         out = out.squeeze(-1)
     z_out = z_out.view(original_z_shape)
+    core_attn_out = core_attn_out.view(original_z_shape)
     return out.to(original_x_dtype), b_out, a_out
 
