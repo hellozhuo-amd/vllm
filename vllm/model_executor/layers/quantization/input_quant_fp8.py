@@ -4,6 +4,7 @@
 import torch
 import torch.nn.functional as F
 
+from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.utils.platform_utils import num_compute_units
 
