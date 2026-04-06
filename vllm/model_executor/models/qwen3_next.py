@@ -1140,6 +1140,10 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
         # 2.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
+            ## TODO: fuse rearrage with chunk kernel as well
+            query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
+                mixed_qkv_non_spec
+            )
             initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
             initial_state[~has_initial_state, ...] = 0
             (
