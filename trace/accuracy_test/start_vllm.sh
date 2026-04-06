@@ -1,4 +1,5 @@
 ## CUDA_VISIBLE_DEVICES=2 HIP_VISIBLE_DEVICES=2 \
+#    --swap_space 64 \
 
 HF_HUB_OFFLINE=1 \
 vllm serve Qwen/Qwen3-Next-80B-A3B-Instruct-FP8     \
@@ -12,5 +13,4 @@ vllm serve Qwen/Qwen3-Next-80B-A3B-Instruct-FP8     \
     --no_async_scheduling \
     --no-enable-prefix-caching \
     --port=8061 \
-    --swap_space 64 \
     --tensor_parallel_size=1
