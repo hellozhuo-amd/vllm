@@ -392,6 +392,7 @@ class W8A8BlockFp8LinearOp:
         weight_scale: torch.Tensor,
         input_scale: torch.Tensor | None = None,
         bias: torch.Tensor | None = None,
+        rms_norm_parameters: dict | None = None,
     ) -> torch.Tensor:
         assert input_scale is None
         # View input as 2D matrix for fp8 methods
@@ -412,7 +413,7 @@ class W8A8BlockFp8LinearOp:
             output = self._run_deepgemm(input_2d, weight, weight_scale)
         else:
             output = self.w8a8_blockscale_op(
-                input_2d, weight, weight_scale, input_scale
+                input_2d, weight, weight_scale, input_scale, rms_norm_parameters
             )
 
         if bias is not None:
@@ -472,6 +473,7 @@ class W8A8BlockFp8LinearOp:
         weight: torch.Tensor,
         weight_scale: torch.Tensor,
         input_scale: torch.Tensor | None = None,
+        rms_norm_parameters: dict | None = None,
     ) -> torch.Tensor:
         assert self.act_quant_group_shape == GroupShape(1, 128)
 
@@ -490,7 +492,7 @@ class W8A8BlockFp8LinearOp:
         if input_scale is not None:
             q_input = input_2d
         else:
-            q_input, input_scale = self.input_quant_op(input_2d, use_triton=use_triton)
+            q_input, input_scale = self.input_quant_op(input_2d, rms_norm_parameters=rms_norm_parameters, use_triton=use_triton)
 
         return gemm_a8w8_blockscale_op(
             q_input,

@@ -96,7 +96,7 @@ def layer_norm_fwd_kernel(
 
     # Compute offsets for 2D tile
     row_offsets = rows[:, None] * stride_x_row
-    col_offsets = cols[None, :] + group * N
+    col_offsets = cols[None, :] + group * N # maybe * BLOCK_N?
 
     # Base pointers
     X_base = X + row_offsets + col_offsets
@@ -141,7 +141,7 @@ def layer_norm_fwd_kernel(
     tl.store(Rstd + rstd_offsets, rstd, mask=rstd_mask)
 
     # Load weights and biases (broadcast across rows)
-    w_offsets = cols + group * N
+    w_offsets = cols + group * N # maybe * BLOCK_N?
     w_mask = cols < N
     w = tl.load(W + w_offsets, mask=w_mask, other=0.0).to(tl.float32)
 
