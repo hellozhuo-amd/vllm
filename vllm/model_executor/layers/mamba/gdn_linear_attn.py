@@ -69,26 +69,28 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 # aiter is missing, unsupported, or disabled).
 GDN_AITER_TRITON_AVAILABLE = False
 gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule = None
-gdn_aiter_causal_conv1d_update_fast = None
-gdn_aiter_fused_reshape_causal_conv1d_update_fast = None
+gdn_aiter_causal_conv1d_update_single_token = None
+gdn_aiter_fused_reshape_causal_conv1d_update_single_token = None
 
 try:
     from vllm._aiter_ops import is_aiter_found_and_supported
 
     if envs.VLLM_ROCM_USE_AITER and is_aiter_found_and_supported():
-        from aiter.ops.triton.causal_conv1d_update_fast import (
-            causal_conv1d_update_fast as _gdn_aiter_causal_conv1d_update_fast,
+        from aiter.ops.triton.causal_conv1d_update_single_token import (
+            causal_conv1d_update_single_token as _gdn_aiter_causal_conv1d_update_single_token,
         )
-        from aiter.ops.triton.causal_conv1d_update_fast import (
-            fused_reshape_causal_conv1d_update_fast as _gdn_aiter_fused_reshape_causal_conv1d_update_fast,
+        from aiter.ops.triton.causal_conv1d_update_single_token import (
+            fused_reshape_causal_conv1d_update_single_token as _gdn_aiter_fused_reshape_causal_conv1d_update_single_token,
         )
         from aiter.ops.triton.gated_delta_net import (
             fused_rearrange_sigmoid_gated_delta_rule as _gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule,
         )
 
-        gdn_aiter_causal_conv1d_update_fast = _gdn_aiter_causal_conv1d_update_fast
-        gdn_aiter_fused_reshape_causal_conv1d_update_fast = (
-            _gdn_aiter_fused_reshape_causal_conv1d_update_fast
+        gdn_aiter_causal_conv1d_update_single_token = (
+            _gdn_aiter_causal_conv1d_update_single_token
+        )
+        gdn_aiter_fused_reshape_causal_conv1d_update_single_token = (
+            _gdn_aiter_fused_reshape_causal_conv1d_update_single_token
         )
         gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule = (
             _gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule
@@ -1335,7 +1337,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             ).transpose(0, 1)
         elif attn_metadata.num_decodes > 0:
             if mixed_qkv_non_spec is not None:
-                mixed_qkv_non_spec = gdn_aiter_causal_conv1d_update_fast(
+                mixed_qkv_non_spec = gdn_aiter_causal_conv1d_update_single_token(
                     mixed_qkv_non_spec,
                     conv_state,
                     conv_weights,
@@ -1348,7 +1350,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 )
             else:
                 mixed_qkv_non_spec, b, a = (
-                    gdn_aiter_fused_reshape_causal_conv1d_update_fast(
+                    gdn_aiter_fused_reshape_causal_conv1d_update_single_token(
                         qkvz,
                         num_actual_tokens,
                         self.num_k_heads // self.tp_size,
