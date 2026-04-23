@@ -286,7 +286,7 @@ class AiterFusedAddRMSFp8GroupQuantPattern(AiterRMSNormQuantPattern):
 class AiterRMSNormGatedFp8GroupQuantPattern(AiterRMSNormQuantPattern):
     """
     Matches decomposed RMSNormGated + reshape + group FP8 quant and replaces
-    with rocm_aiter_rmsnorm_input_quant_fp8.
+    with rocm_aiter_rmsnorm_gated_fp8_group_quant.
 
     The norm operates per-head on (N*H, D) tensors. The compiler folds the
     reshape chain so after norm the result goes through reshape→merge→quant.
@@ -294,7 +294,7 @@ class AiterRMSNormGatedFp8GroupQuantPattern(AiterRMSNormQuantPattern):
     unify aten.view/aten.reshape so the pattern matches the actual graph.
     """
 
-    FUSED_OP = rocm_aiter_ops.get_rmsnorm_input_quant_fp8_op()
+    FUSED_OP = rocm_aiter_ops.get_rmsnorm_gated_fp8_group_quant_op()
 
     def __init__(
         self,
@@ -617,7 +617,7 @@ class RocmAiterTritonAddRMSNormPadFusionPass(VllmPatternMatcherPass):
 class RocmAiterRMSNormGatedQuantFusionPass(VllmPatternMatcherPass):
     """
     Fuses decomposed RMSNormGated + group FP8 quant into
-    rocm_aiter_rmsnorm_input_quant_fp8. Runs independently of
+    rocm_aiter_rmsnorm_gated_fp8_group_quant. Runs independently of
     fuse_norm_quant so it works with -rms_norm -quant_fp8 custom_ops.
     """
 

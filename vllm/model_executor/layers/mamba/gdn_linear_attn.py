@@ -770,9 +770,8 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         # ============================================================
         # Part 3: Output Projection
         # ============================================================
-        # The RMSNormGated + quant fusion is handled by the compilation
-        # pass (RMSNormGatedQuantManualFusion) which replaces the
-        # decomposed ops with rocm_aiter_rmsnorm_input_quant_fp8.
+        # On ROCm with aiter enabled, RocmAiterRMSNormGatedQuantFusionPass may
+        # fuse norm + FP8 quant into rocm_aiter_rmsnorm_gated_fp8_group_quant.
         z_shape_og = z.shape
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
