@@ -1018,12 +1018,11 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         attn_metadata = attn_metadata_raw[self.prefix]  # type: ignore[index]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
 
-        # The AITER fused reshape/conv kernel expects Qwen3-Next's interleaved
-        # GQA layout. Qwen3.5 uses a non-interleaved q/k/v/z layout and must use
-        # the generic path below to split/rearrange inputs correctly.
+        # aiter PR #3251 added gqa_interleaved_layout to the fused kernel, so
+        # both Qwen3-Next (interleaved) and Qwen3.5 (non-interleaved) can now
+        # use the AITER fast path.
         if (
-            self.gqa_interleaved_layout
-            and attn_metadata.spec_sequence_masks is None
+            attn_metadata.spec_sequence_masks is None
             and attn_metadata.num_prefills == 0
             and attn_metadata.num_decodes > 0
         ):
@@ -1358,6 +1357,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                     : attn_metadata.num_actual_tokens
                 ],
                 validate_data=True,
+                gqa_interleaved_layout=self.gqa_interleaved_layout,
             )
         )
 
